@@ -365,6 +365,21 @@ should_force_self() {  # <reason>
   return 1
 }
 
+# A real watcher WAKE reason starts with one of these prefixes. Anything else on
+# the watcher child's stdout (e.g. "watcher: already running" on a singleton-lock
+# collision, reachable if the daemon was SIGKILL'd and its orphaned watcher child
+# still holds the #29 singleton lock) is a STATUS line, not a wake: handling it
+# as an unknown wake would flood the escalation buffer and restart the child with
+# no crash backoff. The main loop treats a non-wake line as idle (log + sleep +
+# continue), so a singleton collision cannot hot-loop escalations.
+is_wake_reason() {  # <reason>
+  local reason=$1
+  case "$reason" in
+    signal:*|stale:*|check:*|heartbeat|heartbeat:*) return 0 ;;
+  esac
+  return 1
+}
+
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
@@ -532,6 +547,16 @@ fm_super_main() {
           log "watcher exited rc=$rc reason='$reason'; restarting after ${backoff_secs}s"
           WATCHER_PID=""
           sleep "$backoff_secs"
+          continue
+        fi
+        # Non-wake stdout (e.g. a watcher singleton-collision "already running"
+        # status line) is NOT a wake: idling here prevents an escalation flood
+        # and a backoff-less child restart. record_crash is intentionally
+        # skipped (rc=0, this is normal idle, not a crash).
+        if ! is_wake_reason "$reason"; then
+          log "watcher non-wake stdout, idling: $reason"
+          WATCHER_PID=""
+          sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
         log "wake: $reason"

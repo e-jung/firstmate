@@ -542,6 +542,18 @@ test_inject_skip_forces_self() {
   pass "INJECT_SKIP forces self-handle, bypassing captain-relevant classification"
 }
 
+test_is_wake_reason_distinguishes_status_stdout() {
+  # Real wake reasons are recognized; watcher status lines (singleton collision)
+  # are not, so the main loop can idle them without flooding escalations.
+  is_wake_reason "signal: /x/y.status" || fail "signal: not recognized as wake"
+  is_wake_reason "stale: s:fm-x" || fail "stale: not recognized as wake"
+  is_wake_reason "check: /s/c.sh: merged" || fail "check: not recognized as wake"
+  is_wake_reason "heartbeat" || fail "heartbeat not recognized as wake"
+  is_wake_reason "watcher: already running" && fail "singleton status line misclassified as wake"
+  is_wake_reason "watcher: already running pid 123" && fail "singleton status (pid) misclassified as wake"
+  pass "is_wake_reason distinguishes watcher wake reasons from singleton-status stdout"
+}
+
 test_terminal_stale_escalate_leaves_no_marker() {
   local dir state win key
   dir=$(make_supercase stale-terminal-nomarker)
@@ -601,5 +613,6 @@ test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self
+test_is_wake_reason_distinguishes_status_stdout
 test_terminal_stale_escalate_leaves_no_marker
 test_signal_escalate_marks_seen_no_catchall_refire
