@@ -395,7 +395,7 @@ The printed one-shot reason line is still useful, but the drained queue is the l
 After handling drained wakes, re-arm `bin/fm-watch.sh` before you end the turn.
 The watcher is singleton-safe: if one is already alive with a fresh liveness beacon, another invocation exits cleanly instead of creating a duplicate watcher; if the live holder's beacon is stale, the new invocation exits with an actionable failure.
 Do not pkill-and-restart the watcher as a routine operation; just arm it, and let the singleton lock no-op when appropriate.
-P2/P3 of the watcher reliability design - a persistent detector daemon and blocking waiter split - are deferred; this phase intentionally preserves the current one-shot restart model.
+P2 of the watcher reliability design - proactive routing of wakes into supervisor turns for chat-mode / walk-away supervision - is provided by the optional sub-supervisor (`bin/fm-supervise-daemon.sh`, below). P3, a blocking-waiter split, remains deferred; the one-shot restart model is otherwise preserved.
 Waiting on the watcher is intentionally silent.
 After arming it, do not send idle progress updates to the captain; wait until it returns `signal`, `stale`, `check`, or `heartbeat`, unless the captain asks for status.
 Empty polls, elapsed waiting time, and "still no change" are tool bookkeeping, not conversational progress.
@@ -436,6 +436,25 @@ Background that work so watcher wakes can interleave with it and the supervision
 Token discipline: status files before panes; default peeks to 40 lines; never stream a pane repeatedly through yourself; batch what you tell the captain.
 The context-% shown in a peek is not actionable as crew health; ignore it and intervene only on real signals (`signal`, `stale`, `needs-decision`, `blocked`), looping or confusion in the pane, or a question the brief already answers.
 Silence is the correct state while a healthy background watcher is waiting.
+
+### Sub-supervisor (optional; chat-mode / walk-away)
+
+`bin/fm-supervise-daemon.sh` is an OPTIONAL layer for chat-mode or walk-away supervision. It wraps `fm-watch.sh`: it runs the watcher as a child in a loop, classifies each wake reason in bash, and **self-handles the routine majority without consuming a firstmate turn**. Only captain-relevant events escalate to firstmate's context - and even then as one pre-read, batched digest rather than a per-wake injection. It is the token-efficient P2 layer that closes the chat-mode wake-routing gap (#27).
+
+Deploy it (a captain decision; it is not armed by default) by running it as a long-lived background process. With it live:
+- **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher; the singleton lock no-ops a stray arm harmlessly, but the daemon is the single owner.
+- **`fm-wake-drain.sh` still runs at the start of every escalated firstmate turn** - it is the lossless backstop. The daemon routes; the queue guarantees nothing is lost. The two are complementary, not redundant.
+
+**Classification policy (per wake):**
+- `signal` whose status content has no captain-relevant verb (`done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged`) → **self-handle**. Captain-relevant verb → escalate.
+- `check` → always escalate (check scripts print only when firstmate should wake).
+- `stale` with a terminal status → escalate. Non-terminal stale is transient: the daemon records a marker and self-handles; if the pane is still idle past `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a possible wedge. This bounds wedge-detection latency to the threshold plus a tick - a delay, never a loss, and healthy crewmates (which are autonomous and do not wait on firstmate mid-task) are unaffected.
+- `heartbeat` → self-handle; the daemon runs its own cheap bash fleet scan every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a captain-relevant status line the per-wake classifier might miss.
+- Unknown reason, or any uncertainty → **escalate (fail-safe)**.
+
+**Escalation format:** escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 = immediate) and flushed as ONE distilled digest carrying the pre-read status summaries and a recommended action, with "re-arm not needed" - the daemon is the watcher owner. This is why fewer, cheaper firstmate turns handle the same fleet.
+
+**Reliability properties (must hold):** nothing is lost (the #29 queue plus `fm-wake-drain.sh` recover any missed/crashed injection); wedge detection is bounded-latency, not lossy; the catch-all scan backs up the keyword classifier; the daemon preserves single-instance `flock`, crash-loop backoff, a pane-gone guard, and a signal-trapped shutdown that flushes buffered escalations before exit. `FM_INJECT_SKIP` (default `heartbeat`) force-self-handles matching kinds, overriding classification - use sparingly.
 
 ### Stuck-crewmate playbook (escalate in order)
 
