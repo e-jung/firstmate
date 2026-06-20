@@ -482,7 +482,9 @@ fm_super_main() {
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
     fi
-    [ -n "${CUR_TMP:-}" ] && rm -f "$CUR_TMP" 2>/dev/null || true
+    if [ -n "${CUR_TMP:-}" ]; then
+      rm -f "$CUR_TMP" 2>/dev/null || true
+    fi
     rm -f "$PIDFILE" 2>/dev/null || true
     log "daemon shutting down"
     exit 0
@@ -539,8 +541,12 @@ fm_super_main() {
         # child exited: reap + classify its wake reason
         if wait "${WATCHER_PID}"; then rc=0; else rc=$?; fi
         reason=""
-        [ -n "${CUR_TMP:-}" ] && [ -e "${CUR_TMP:-}" ] && reason=$(<"${CUR_TMP}")
-        [ -n "${CUR_TMP:-}" ] && rm -f "${CUR_TMP}" 2>/dev/null || true
+        if [ -n "${CUR_TMP:-}" ] && [ -e "${CUR_TMP:-}" ]; then
+          reason=$(<"${CUR_TMP}")
+        fi
+        if [ -n "${CUR_TMP:-}" ]; then
+          rm -f "${CUR_TMP}" 2>/dev/null || true
+        fi
         CUR_TMP=""
         if [ "$rc" -ne 0 ] || [ -z "$reason" ]; then
           record_crash
