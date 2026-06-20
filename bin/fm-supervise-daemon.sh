@@ -203,8 +203,10 @@ pane_is_busy() {  # <window>
 }
 
 escalate_add() {  # <state> <distilled-item>
-  local state=$1 item=$2
-  printf '%s\n' "$item" >> "$state/.subsuper-escalations"
+  local state=$1 item=$2 buf
+  buf="$state/.subsuper-escalations"
+  [ -s "$buf" ] || _now > "${buf}.since"
+  printf '%s\n' "$item" >> "$buf"
 }
 
 # Flush the escalation buffer as ONE batched digest to the supervisor pane.
@@ -214,17 +216,22 @@ escalate_flush() {  # <state>
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
-  # Join buffered items with " | " into a single digest line.
-  msg=$(paste -sd ' | ' "$buf" 2>/dev/null)
+  # Join buffered items with the literal " | " separator into one digest line.
+  msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
   msg=$(printf 'Supervisor escalate (%s event(s), batched):\n%s\nStatus pre-read by sub-supervisor. Re-arm not needed (watcher is daemon-managed).' "$n" "$msg")
-  if inject_msg "$msg"; then : > "$buf"; return 0; fi
+  if inject_msg "$msg"; then : > "$buf"; rm -f "${buf}.since"; return 0; fi
   return 1
 }
 
-_oldest_line_age() {  # <file> -> seconds since oldest line's mtime-ish (file mtime used)
-  local f=$1
+_oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first arrived (sidecar epoch)
+  local f=$1 since
   [ -s "$f" ] || { echo 999999; return; }
-  _file_age "$f"
+  since="${f}.since"
+  if [ -r "$since" ]; then
+    echo $(( $(_now) - $(cat "$since" 2>/dev/null || echo 0) ))
+  else
+    echo 999999
+  fi
 }
 
 # --- housekeeping (runs every tick while the watcher is mid-cycle) ----------
