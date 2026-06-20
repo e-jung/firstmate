@@ -477,10 +477,31 @@ test_escalate_batches_into_one_digest() {
     FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" || fail "escalate_flush failed"
   grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
   grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
+  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
+    || fail "batch digest did not join events with literal ' | '"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after flush"
+  [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
   n=$(grep -c '\[ENTER\]' "$sent")
   [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
   pass "multiple escalations flush as a single batched digest"
+}
+
+test_escalate_batch_age_uses_first_append() {
+  local dir state fakebin sent
+  dir=$(make_supercase batch-age)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  escalate_add "$state" "event A: done: PR 1"
+  escalate_add "$state" "event B: done: PR 2"
+  echo $(( $(date +%s) - 100 )) > "$state/.subsuper-escalations.since"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 housekeeping "$state"
+  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
+    || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
+  [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
+  [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
+  pass "batch flush measures max-delay from the first append, not the last"
 }
 
 test_heartbeat_scan_dedup() {
@@ -541,6 +562,7 @@ test_stale_terminal_escalates
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_escalate_batches_into_one_digest
+test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self
