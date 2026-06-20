@@ -432,6 +432,14 @@ Silence is the correct state while a healthy background watcher is waiting.
    The worktree and commits persist; this is cheap.
 5. Second relaunch fails too: write `failed` to backlog, tell the captain with evidence.
 
+### Self-triggering supervision (optional)
+
+`bin/fm-supervise-daemon.sh` is an optional wrapper that makes chat-mode supervision self-triggering (#27): it runs `fm-watch.sh` in a loop and, each time the watcher exits with a wake reason (`signal:`/`stale:`/`check:`/`heartbeat`), injects that reason as a message into the supervisor's tmux pane so the supervisor takes a fresh turn even while the captain is idle - closing the gap where crewmate wakes go unhandled between captain messages.
+It wraps the watcher without modifying it: it does NOT replace the "restart the watcher after each wake" discipline, it automates it, and it adds the wake-to-supervisor-turn routing that the bare watcher lacks.
+The supervisor target is `FM_SUPERVISOR_TARGET` (default `firstmate:0`); the daemon is single-instance via `flock`, traps SIGTERM/SIGINT for clean shutdown, logs each wake to `state/.supervise-daemon.log`, and restarts a crashing watcher rather than dying.
+Adoption is a deployment decision, not automatic: firstmate launches the daemon (as a background task, once the supervisor pane exists) only when it wants unattended/chat-mode reliability, and stops it with `kill -TERM $(cat state/.supervise-daemon.pid)`.
+Storm safety is unchanged - the watcher still coalesces signals within its grace window, so the daemon injects exactly once per watcher exit.
+
 ## 9. Escalation and captain etiquette
 
 **Talk in outcomes, not mechanics.**
