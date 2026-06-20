@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-supervise-daemon.sh — #29-aware sub-supervisor (closes #27's P2/P3).
+# fm-supervise-daemon.sh — #29-aware sub-supervisor (closes #27's P2; P3 deferred).
 #
 # Wraps bin/fm-watch.sh: runs it as a child, classifies each wake reason, and
 # either SELF-HANDLES the routine majority in bash (no firstmate turn) or
