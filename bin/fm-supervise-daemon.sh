@@ -194,6 +194,38 @@ stale_marker_remove() {  # <window> <state>
   rm -f "$state/.subsuper-stale-$key"
 }
 
+# Record the seen-status marker for a captain-relevant status line so the
+# heartbeat catch-all scan does not re-fire it. The single source of truth for
+# the .subsuper-seen-status-<task> dedup state: called from both the per-wake
+# escalate path and the catch-all scan.
+mark_status_seen() {  # <state> <task> <last-line>
+  local state=$1 task=$2 line=$3
+  printf '%s' "$line" > "$state/.subsuper-seen-status-$(_stale_key "$task")"
+}
+
+# Mark every captain-relevant status line a per-wake classification escalated as
+# seen, so the catch-all scan does not re-escalate the same line within
+# HEARTBEAT_SCAN_SECS. Mirrors classify_signal/classify_stale's relevance test.
+mark_escalated_seen() {  # <kind> <arg> <state>
+  local kind=$1 arg=$2 state=$3 f last task
+  case "$kind" in
+    signal)
+      for f in $arg; do
+        [ -e "$f" ] || continue
+        last=$(last_status_line "$f")
+        [ -n "$last" ] || continue
+        status_is_captain_relevant "$last" || continue
+        task=$(basename "$f"); task="${task%.status}"
+        mark_status_seen "$state" "$task" "$last"
+      done ;;
+    stale)
+      task=$(window_to_task "$arg")
+      last=$(last_status_line "$state/$task.status")
+      [ -n "$last" ] && status_is_captain_relevant "$last" \
+        && mark_status_seen "$state" "$task" "$last" ;;
+  esac
+}
+
 # 0 if the pane is currently showing a busy signature (crewmate resumed/working).
 pane_is_busy() {  # <window>
   local win=$1 tail40
@@ -290,7 +322,7 @@ housekeeping() {  # <state>
       seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
       [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] && continue
       escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"
-      printf '%s' "$last" > "$seen"
+      mark_status_seen "$state" "$task" "$last"
     done
   fi
 }
@@ -337,14 +369,16 @@ should_force_self() {  # <reason>
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
   local reason=$1 state=$2 decision action distilled
+  local kind="" arg=""
   if should_force_self "$reason"; then
     log "wake force-self (FM_INJECT_SKIP): $reason"
     return
   fi
   case "$reason" in
-    signal:*) decision=$(classify_signal "${reason#signal: }" "$state") ;;
-    stale:*)  stale_marker_record "${reason#stale: }" "$state"
-              decision=$(classify_stale "${reason#stale: }" "$state") ;;
+    signal:*) kind=signal; arg="${reason#signal: }"
+              decision=$(classify_signal "$arg" "$state") ;;
+    stale:*)  kind=stale; arg="${reason#stale: }"
+              decision=$(classify_stale "$arg" "$state") ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
     *)        decision=$(classify_unknown "$reason") ;;
@@ -354,8 +388,15 @@ handle_wake() {  # <reason> <state>
   if [ "$action" = "escalate" ]; then
     log "escalate: $reason -> $distilled"
     escalate_add "$state" "$distilled"
+    # A terminal-stale escalate must not leave a persistence marker behind, or
+    # housekeeping re-escalates the same pane as a false wedge later.
+    [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
+    mark_escalated_seen "$kind" "$arg" "$state"
     [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
   else
+    # Transient (non-terminal) stale: record/refresh the marker so housekeeping
+    # can age it; the persistence recheck, not this wake, escalates a wedge.
+    [ "$kind" = "stale" ] && stale_marker_record "$arg" "$state"
     log "self-handle: $reason -> $distilled"
   fi
 }
@@ -395,7 +436,7 @@ fm_super_main() {
   local CRASH_THRESHOLD=${FM_CRASH_THRESHOLD:-$CRASH_THRESHOLD_DEFAULT}
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
-  local CRASH_NORMAL_SLEEP=${FM_CRASH_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
+  local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
 
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 

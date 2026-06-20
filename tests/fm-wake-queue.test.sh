@@ -542,6 +542,41 @@ test_inject_skip_forces_self() {
   pass "INJECT_SKIP forces self-handle, bypassing captain-relevant classification"
 }
 
+test_terminal_stale_escalate_leaves_no_marker() {
+  local dir state win key
+  dir=$(make_supercase stale-terminal-nomarker)
+  state="$dir/state"
+  win="sess:fm-fin-n7"
+  printf 'done: PR https://x/y/pull/7\n' > "$state/fin-n7.status"
+  key=$(printf '%s' "fin-n7" | tr ':/.' '___')
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
+  [ -s "$state/.subsuper-escalations" ] || fail "terminal stale was not escalated"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "terminal stale left a persistence marker (housekeeping would re-escalate)"
+  : > "$state/.subsuper-escalations"
+  rm -f "$state/.subsuper-last-scan"
+  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "housekeeping re-escalated a terminal stale as a wedge"
+  pass "terminal-stale escalate removes its marker so housekeeping does not re-escalate"
+}
+
+test_signal_escalate_marks_seen_no_catchall_refire() {
+  local dir state key
+  dir=$(make_supercase signal-seen)
+  state="$dir/state"
+  printf 'done: PR https://x/y/pull/8\n' > "$state/sig-t8.status"
+  FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/sig-t8.status" "$state"
+  [ -s "$state/.subsuper-escalations" ] || fail "captain signal was not escalated"
+  key=$(printf '%s' "sig-t8" | tr ':/.' '___')
+  [ "$(cat "$state/.subsuper-seen-status-$key" 2>/dev/null || true)" = "done: PR https://x/y/pull/8" ] \
+    || fail "captain signal escalate did not write the seen-status marker"
+  : > "$state/.subsuper-escalations"
+  rm -f "$state/.subsuper-last-scan"
+  FM_STATE_OVERRIDE="$state" housekeeping "$state"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "catch-all scan re-fired an already-escalated signal"
+  pass "captain signal escalate marks seen so the catch-all scan does not re-fire"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -566,3 +601,5 @@ test_escalate_batch_age_uses_first_append
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self
+test_terminal_stale_escalate_leaves_no_marker
+test_signal_escalate_marks_seen_no_catchall_refire
