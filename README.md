@@ -170,6 +170,13 @@ FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=20   # seconds allowed for bootstrap's best-effort clone refresh
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
 FM_BUSY_REGEX='esc (to )?interrupt|Working\.\.\.'   # busy-pane signatures, extend per harness
+# sub-supervisor (bin/fm-supervise-daemon.sh); optional, not armed by default
+FM_SUPERVISOR_TARGET=firstmate:0   # supervisor tmux target the daemon injects escalations into
+FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
+FM_STALE_ESCALATE_SECS=240         # idle seconds before a stale pane escalates as a possible wedge
+FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
+FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
+FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale-recheck, and scan passes
 ```
 
 ## Development
