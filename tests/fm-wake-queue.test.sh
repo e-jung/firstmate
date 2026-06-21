@@ -271,7 +271,7 @@ SH
 
 # Catch-all backstop: an old edge-triggered check that swallowed its own
 # transition (advanced .babysit-*.seen inside the script but lost stdout) is
-# force-escalated within one sweep by the heartbeat catch-all scanning the
+# force-escalated within one sweep by the watcher's catch-all scanning the
 # sidecar. This is the belt-and-suspenders safety net that would have surfaced
 # PR #3095 within one scan even without the lossless primary path.
 test_catch_all_escalates_swallowed_transition() {
