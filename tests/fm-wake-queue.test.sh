@@ -166,6 +166,126 @@ SH
   pass "check output is queued before cadence suppression"
 }
 
+# Regression for the missed PR #3095 merge: a check wake must survive a
+# crash/race between enqueue and suppress. The watcher enqueues to the durable
+# queue BEFORE advancing the .seen-check marker, so even if the marker is never
+# advanced (simulated here via FM_WATCH_BREAK_AFTER_CHECK_ENQUEUE), the wake is
+# already in the queue and is re-detected next cycle.
+test_check_wake_survives_lost_delivery() {
+  local dir state fakebin out drain_out check_file seen_check
+  dir=$(make_case check-lossless)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/pr-3095.check.sh"
+  seen_check="$state/.seen-check-pr-3095.check.sh"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'merged: https://example.test/pr/3095\n'
+SH
+  chmod +x "$check_file"
+  # Cycle 1: enqueue, then simulate a crash before the suppression marker
+  # advances. The wake is already durable; the marker is still absent.
+  PATH="$fakebin:$PATH" FM_WATCH_BREAK_AFTER_CHECK_ENQUEUE=1 FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>/dev/null &
+  wait_for_exit "$!" 40
+  local crash_status=$?
+  [ "$crash_status" -eq 99 ] || fail "crashing watcher did not simulate the post-enqueue crash (exit $crash_status)"
+  [ ! -e "$seen_check" ] || fail "suppression marker advanced before the wake was durable (enqueue-before-suppress broken)"
+  # The wake survived the crash in the durable queue.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after crash failed"
+  grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$check_file" | grep -F 'pr/3095' >/dev/null || fail "check wake was lost when delivery failed (the #3095 regression)"
+  # Cycle 2: re-run normally. The un-advanced marker means the delta is
+  # re-detected, enqueued again (deduped downstream), and now suppressed.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit on re-detection"
+  grep -F "check: $check_file: merged: https://example.test/pr/3095" "$out" >/dev/null || fail "watcher did not re-detect the delta after the crash"
+  [ -e "$seen_check" ] || fail "suppression marker was not advanced after a clean delivery"
+  pass "check wake is enqueued before suppression so a lost delivery is recovered"
+}
+
+# Dedup: a stateless check that always prints the same state must wake exactly
+# once; subsequent identical output is suppressed by the watcher's .seen-check.
+test_check_dedup_suppresses_repeats() {
+  local dir state fakebin out drain_out check_file count
+  dir=$(make_case check-dedup)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/steady.check.sh"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'merged\n'
+SH
+  chmod +x "$check_file"
+  # Cycle 1: empty -> "merged" is a delta -> wake.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit for first check wake"
+  grep -Fx "check: $check_file: merged" "$out" >/dev/null || fail "watcher did not wake on first check output"
+  # Cycle 2: same output -> no delta -> no wake (watcher loops until the
+  # timeout kills it; the background poll is what lets wait_for_exit return).
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  local pid=$!
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    fail "watcher woke on a duplicate check output (dedup broken)"
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  # Only the first wake should be in the queue.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain failed"
+  count=$(grep -c "$(printf '\tcheck\t')" "$drain_out" || true)
+  [ "$count" -eq 1 ] || fail "expected 1 deduped check wake, got $count"
+  pass "watcher-side .seen-check dedup suppresses repeated identical check output"
+}
+
+# Catch-all backstop: an old edge-triggered check that swallowed its own
+# transition (advanced .babysit-*.seen inside the script but lost stdout) is
+# force-escalated within one sweep by the heartbeat catch-all scanning the
+# sidecar. This is the belt-and-suspenders safety net that would have surfaced
+# PR #3095 within one scan even without the lossless primary path.
+test_catch_all_escalates_swallowed_transition() {
+  local dir state fakebin out drain_out check_file sidecar escalated
+  dir=$(make_case check-catchall)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/legacy-pr.check.sh"
+  sidecar="$state/.babysit-legacy-pr.seen"
+  escalated="$state/.escalated-.babysit-legacy-pr.seen"
+  # The check already self-suppressed: its sidecar says MERGED, but the script
+  # prints nothing (the transition's stdout was lost - exactly the #3095 mode).
+  printf 'MERGED|comment-a comment-b\n' > "$sidecar"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+# Edge-triggered babysit that already advanced its own .seen; prints nothing.
+exit 0
+SH
+  chmod +x "$check_file"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit for catch-all escalation"
+  grep -F "catch-all" "$out" >/dev/null || fail "catch-all did not force-escalate the swallowed transition"
+  grep -F "MERGED" "$out" >/dev/null || fail "catch-all wake did not report the terminal state"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after catch-all failed"
+  grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$sidecar" >/dev/null || fail "catch-all wake was not queued"
+  [ -e "$escalated" ] || fail "catch-all did not record its dedup marker"
+  # A second sweep must NOT re-escalate (deduped by .escalated-*).
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  local pid=$!
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    fail "catch-all re-escalated an already-handled terminal state (dedup broken)"
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "catch-all force-escalates a swallowed terminal transition within one sweep"
+}
+
 test_atomic_double_drain() {
   local dir state out1 out2 all count leftover
   dir=$(make_case double-drain)
@@ -234,6 +354,9 @@ test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
 test_not_working_stale_enqueue_before_suppressor
 test_check_output_is_queued
+test_check_wake_survives_lost_delivery
+test_check_dedup_suppresses_repeats
+test_catch_all_escalates_swallowed_transition
 test_atomic_double_drain
 test_drain_dedupes_obvious_duplicates
 test_drain_asserts_watcher_liveness
