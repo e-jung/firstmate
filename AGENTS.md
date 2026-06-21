@@ -497,7 +497,7 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's `pr_head=` when available in the task's meta and arms the watcher's merge poll.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
-(The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
+(The check contract, for any custom `state/<id>.check.sh` you write yourself: **print the current state every run** (idempotent), e.g. `echo "merged"` while merged. The watcher dedups against `.seen-check-<name>` and enqueues to the durable queue *before* advancing that marker, so a lost stdout or a crashed watcher can never swallow a wake - the same lossless guarantee signals enjoy. Edge-triggered checks that self-suppress via their own `.babysit-*.seen` are tolerated (empty stdout = no wake), but a swallowed transition is only recovered by the watcher's catch-all backstop, so prefer the stateless "always print current state" form. Finish before `FM_CHECK_TIMEOUT`.)
 
 If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` yourself; that instruction is the explicit approval.
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
@@ -554,6 +554,7 @@ Repeated provably-working stale escalations on one unchanged pane eventually add
 At the start of every wake-handling turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 Session-start recovery is the exception: `bin/fm-session-start.sh` already drained the queue when locked, or deliberately skipped the drain when read-only because another session owns it.
 The printed reason line is still useful, but the drained queue is the lossless backlog.
+Each detected wake is written to the durable queue at `state/.wake-queue` before any suppression marker advances (`.seen-*`, `.stale-*`, `.seen-check-*`, `.escalated-*`, `.last-check`, or `.last-heartbeat`), so a crash between detect and suppress never loses a wake - the same enqueue-before-suppress invariant signal and stale wakes already enjoy, now extended to check wakes.
 **Keep exactly one live cycle.**
 The live cycle is the supervision: while any task is in flight, the active harness protocol must maintain one wait that can wake this primary when `bin/fm-watch.sh` reports an actionable reason.
 After handling drained wakes, resume the emitted harness protocol before ending the turn.
