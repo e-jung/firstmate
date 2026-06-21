@@ -5,15 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 LIB="$ROOT/bin/fm-wake-lib.sh"
-DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
-# Source the daemon's pure classifiers once. The daemon's main loop is skipped
-# under sourcing via its BASH_SOURCE guard, so only the testable functions
-# (classify_*, housekeeping, escalate_*, stale_marker_*) become defined.
-if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
-  export FM_TEST_DAEMON_SOURCED=1
-  # shellcheck source=bin/fm-supervise-daemon.sh
-  . "$DAEMON"
-fi
 TMP_ROOT=
 
 fail() {
@@ -55,44 +46,6 @@ if [ "${1:-}" = "capture-pane" ]; then
   fi
   exit 0
 fi
-exit 1
-SH
-  chmod +x "$fakebin/tmux"
-  printf '%s\n' "$dir"
-}
-
-# Like make_case, but the fake tmux also covers the sub-supervisor daemon's
-# surface (display-message pane probe, send-keys capture) so the daemon's
-# injection + housekeeping paths can be exercised. Behavior is controlled via
-# FM_FAKE_TMUX_* env vars set per test.
-make_supercase() {
-  local name=$1 dir fakebin
-  dir="$TMP_ROOT/$name"
-  fakebin="$dir/fakebin"
-  mkdir -p "$dir/state" "$fakebin"
-  cat > "$fakebin/tmux" <<'SH'
-#!/usr/bin/env bash
-set -u
-case "${1:-}" in
-  display-message)
-    [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] || exit 1
-    printf 'fakepane\n'; exit 0 ;;
-  list-windows)
-    [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
-    exit 0 ;;
-  capture-pane)
-    [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ] && cat "$FM_FAKE_TMUX_CAPTURE" 2>/dev/null
-    exit 0 ;;
-  send-keys)
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        -l) shift; [ "$#" -gt 0 ] && printf '%s\n' "$1" >> "${FM_FAKE_TMUX_SENT:-/dev/null}" ;;
-        Enter) printf '[ENTER]\n' >> "${FM_FAKE_TMUX_SENT:-/dev/null}" ;;
-      esac
-      shift
-    done
-    exit 0 ;;
-esac
 exit 1
 SH
   chmod +x "$fakebin/tmux"
@@ -240,6 +193,126 @@ SH
   pass "check output is queued before cadence suppression"
 }
 
+# Regression for the missed PR #3095 merge: a check wake must survive a
+# crash/race between enqueue and suppress. The watcher enqueues to the durable
+# queue BEFORE advancing the .seen-check marker, so even if the marker is never
+# advanced (simulated here via FM_WATCH_BREAK_AFTER_CHECK_ENQUEUE), the wake is
+# already in the queue and is re-detected next cycle.
+test_check_wake_survives_lost_delivery() {
+  local dir state fakebin out drain_out check_file seen_check
+  dir=$(make_case check-lossless)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/pr-3095.check.sh"
+  seen_check="$state/.seen-check-pr-3095.check.sh"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'merged: https://example.test/pr/3095\n'
+SH
+  chmod +x "$check_file"
+  # Cycle 1: enqueue, then simulate a crash before the suppression marker
+  # advances. The wake is already durable; the marker is still absent.
+  PATH="$fakebin:$PATH" FM_WATCH_BREAK_AFTER_CHECK_ENQUEUE=1 FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>/dev/null &
+  wait_for_exit "$!" 40
+  local crash_status=$?
+  [ "$crash_status" -eq 99 ] || fail "crashing watcher did not simulate the post-enqueue crash (exit $crash_status)"
+  [ ! -e "$seen_check" ] || fail "suppression marker advanced before the wake was durable (enqueue-before-suppress broken)"
+  # The wake survived the crash in the durable queue.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after crash failed"
+  grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$check_file" | grep -F 'pr/3095' >/dev/null || fail "check wake was lost when delivery failed (the #3095 regression)"
+  # Cycle 2: re-run normally. The un-advanced marker means the delta is
+  # re-detected, enqueued again (deduped downstream), and now suppressed.
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit on re-detection"
+  grep -F "check: $check_file: merged: https://example.test/pr/3095" "$out" >/dev/null || fail "watcher did not re-detect the delta after the crash"
+  [ -e "$seen_check" ] || fail "suppression marker was not advanced after a clean delivery"
+  pass "check wake is enqueued before suppression so a lost delivery is recovered"
+}
+
+# Dedup: a stateless check that always prints the same state must wake exactly
+# once; subsequent identical output is suppressed by the watcher's .seen-check.
+test_check_dedup_suppresses_repeats() {
+  local dir state fakebin out drain_out check_file count
+  dir=$(make_case check-dedup)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/steady.check.sh"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'merged\n'
+SH
+  chmod +x "$check_file"
+  # Cycle 1: empty -> "merged" is a delta -> wake.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit for first check wake"
+  grep -Fx "check: $check_file: merged" "$out" >/dev/null || fail "watcher did not wake on first check output"
+  # Cycle 2: same output -> no delta -> no wake (watcher loops until the
+  # timeout kills it; the background poll is what lets wait_for_exit return).
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  local pid=$!
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    fail "watcher woke on a duplicate check output (dedup broken)"
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  # Only the first wake should be in the queue.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain failed"
+  count=$(grep -c "$(printf '\tcheck\t')" "$drain_out" || true)
+  [ "$count" -eq 1 ] || fail "expected 1 deduped check wake, got $count"
+  pass "watcher-side .seen-check dedup suppresses repeated identical check output"
+}
+
+# Catch-all backstop: an old edge-triggered check that swallowed its own
+# transition (advanced .babysit-*.seen inside the script but lost stdout) is
+# force-escalated within one sweep by the watcher's catch-all scanning the
+# sidecar. This is the belt-and-suspenders safety net that would have surfaced
+# PR #3095 within one scan even without the lossless primary path.
+test_catch_all_escalates_swallowed_transition() {
+  local dir state fakebin out drain_out check_file sidecar escalated
+  dir=$(make_case check-catchall)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  check_file="$state/legacy-pr.check.sh"
+  sidecar="$state/.babysit-legacy-pr.seen"
+  escalated="$state/.escalated-.babysit-legacy-pr.seen"
+  # The check already self-suppressed: its sidecar says MERGED, but the script
+  # prints nothing (the transition's stdout was lost - exactly the #3095 mode).
+  printf 'MERGED|comment-a comment-b\n' > "$sidecar"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+# Edge-triggered babysit that already advanced its own .seen; prints nothing.
+exit 0
+SH
+  chmod +x "$check_file"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wait_for_exit "$!" 40 || fail "watcher did not exit for catch-all escalation"
+  grep -F "catch-all" "$out" >/dev/null || fail "catch-all did not force-escalate the swallowed transition"
+  grep -F "MERGED" "$out" >/dev/null || fail "catch-all wake did not report the terminal state"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after catch-all failed"
+  grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$sidecar" >/dev/null || fail "catch-all wake was not queued"
+  [ -e "$escalated" ] || fail "catch-all did not record its dedup marker"
+  # A second sweep must NOT re-escalate (deduped by .escalated-*).
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  local pid=$!
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    fail "catch-all re-escalated an already-handled terminal state (dedup broken)"
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "catch-all force-escalates a swallowed terminal transition within one sweep"
+}
+
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live
   dir=$(make_case singleton)
@@ -372,227 +445,13 @@ test_guard_rearms_after_draining_pending_queue() {
   pass "guard orders watcher re-arm after queued wake drain"
 }
 
-test_classify_routine_signal_self() {
-  local dir state out
-  dir=$(make_supercase classify-routine)
-  state="$dir/state"
-  printf 'working: step 1\nworking: step 2\n' > "$state/foo-x1.status"
-  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/foo-x1.status" "$state")
-  case "$out" in self\|*) pass "routine signal self-handles" ;; *) fail "routine signal did not self-handle: $out" ;; esac
-}
-
-test_classify_terminal_signal_escalates() {
-  local dir state kw out
-  dir=$(make_supercase classify-terminal)
-  state="$dir/state"
-  for kw in "done: PR https://x/y/pull/1" "needs-decision: pick A" "blocked: no perms" \
-            "failed: rc 2" "PR ready https://x/y/pull/2" "checks green" \
-            "ready in branch fm/t1" "merged"; do
-    printf 'working\n%s\n' "$kw" > "$state/t.status"
-    out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/t.status" "$state")
-    case "$out" in escalate\|*) ;; *) fail "captain verb did not escalate ($kw): $out" ;; esac
-  done
-  pass "captain-relevant status verbs escalate"
-}
-
-test_classify_check_and_unknown_escalate() {
-  local out
-  out=$(classify_check "check: /s/c.check.sh: merged: https://x")
-  case "$out" in escalate\|*) ;; *) fail "check did not escalate: $out" ;; esac
-  out=$(classify_unknown "frobnicate: weird")
-  case "$out" in escalate\|*) ;; *) fail "unknown did not fail-safe escalate: $out" ;; esac
-  out=$(classify_heartbeat)
-  case "$out" in self\|*) ;; *) fail "heartbeat did not self-handle: $out" ;; esac
-  pass "check + unknown escalate; heartbeat self-handles"
-}
-
-test_stale_transient_self_records_marker() {
-  local dir state out key
-  dir=$(make_supercase stale-transient)
-  state="$dir/state"
-  printf 'working: building\n' > "$state/qux-w4.status"
-  stale_marker_record "sess:fm-qux-w4" "$state"
-  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-qux-w4" "$state")
-  case "$out" in self\|*) ;; *) fail "transient stale did not self-handle: $out" ;; esac
-  key=$(printf '%s' "$(window_to_task "sess:fm-qux-w4")" | tr ':/.' '___')
-  [ -e "$state/.subsuper-stale-$key" ] || fail "stale marker was not recorded"
-  pass "transient stale self-handles and records a persistence marker"
-}
-
-test_stale_terminal_escalates() {
-  local dir state out
-  dir=$(make_supercase stale-terminal)
-  state="$dir/state"
-  printf 'done: ready in branch fm/t1\n' > "$state/fin-t5.status"
-  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-fin-t5" "$state")
-  case "$out" in escalate\|*) ;; *) fail "terminal stale did not escalate: $out" ;; esac
-  pass "stale + terminal status escalates immediately"
-}
-
-test_housekeeping_persistent_stale_escalates() {
-  local dir state fakebin win pane key
-  dir=$(make_supercase stale-persistent)
-  state="$dir/state"
-  fakebin="$dir/fakebin"
-  win="sess:fm-pers-w5"
-  pane="$dir/pane.txt"
-  printf 'working\n' > "$state/pers-w5.status"
-  printf 'idle prompt $\n' > "$pane"
-  key=$(printf '%s' "pers-w5" | tr ':/.' '___')
-  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
-  [ -s "$state/.subsuper-escalations" ] || fail "persistent stale was not escalated"
-  [ ! -e "$state/.subsuper-stale-$key" ] || fail "stale marker not cleared after escalation"
-  pass "persistent stale escalates after threshold and clears its marker"
-}
-
-test_housekeeping_resumed_stale_cleared() {
-  local dir state fakebin win pane key
-  dir=$(make_supercase stale-resumed)
-  state="$dir/state"
-  fakebin="$dir/fakebin"
-  win="sess:fm-res-w6"
-  pane="$dir/pane.txt"
-  printf 'working\n' > "$state/res-w6.status"
-  printf 'Working...\n' > "$pane"
-  key=$(printf '%s' "res-w6" | tr ':/.' '___')
-  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
-  [ -e "$state/.subsuper-stale-$key" ] && fail "resumed stale marker was not cleared"
-  [ -s "$state/.subsuper-escalations" ] && fail "resumed stale was escalated"
-  pass "resumed (busy) stale clears its marker without escalating"
-}
-
-test_escalate_batches_into_one_digest() {
-  local dir state fakebin sent n
-  dir=$(make_supercase batch)
-  state="$dir/state"
-  fakebin="$dir/fakebin"
-  sent="$dir/sent.log"; : > "$sent"
-  escalate_add "$state" "event A: done: PR 1"
-  escalate_add "$state" "event B: done: PR 2"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" || fail "escalate_flush failed"
-  grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
-  grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
-    || fail "batch digest did not join events with literal ' | '"
-  [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after flush"
-  [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
-  n=$(grep -c '\[ENTER\]' "$sent")
-  [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
-  pass "multiple escalations flush as a single batched digest"
-}
-
-test_escalate_batch_age_uses_first_append() {
-  local dir state fakebin sent
-  dir=$(make_supercase batch-age)
-  state="$dir/state"
-  fakebin="$dir/fakebin"
-  sent="$dir/sent.log"; : > "$sent"
-  escalate_add "$state" "event A: done: PR 1"
-  escalate_add "$state" "event B: done: PR 2"
-  echo $(( $(date +%s) - 100 )) > "$state/.subsuper-escalations.since"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 housekeeping "$state"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
-    || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
-  [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
-  [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
-  pass "batch flush measures max-delay from the first append, not the last"
-}
-
-test_heartbeat_scan_dedup() {
-  local dir state
-  dir=$(make_supercase scan-dedup)
-  state="$dir/state"
-  printf 'done: ready\n' > "$state/dup-t6.status"
-  rm -f "$state/.subsuper-last-scan"
-  FM_STATE_OVERRIDE="$state" housekeeping "$state"
-  [ -s "$state/.subsuper-escalations" ] || fail "catch-all scan did not escalate a terminal"
-  : > "$state/.subsuper-escalations"
-  echo $(( $(date +%s) - 99999 )) > "$state/.subsuper-last-scan"
-  FM_STATE_OVERRIDE="$state" housekeeping "$state"
-  [ -s "$state/.subsuper-escalations" ] && fail "catch-all scan re-escalated the same terminal (dedup failed)"
-  pass "catch-all scan escalates a missed terminal once, not twice"
-}
-
-test_handle_wake_routes_self_and_escalate() {
-  local dir state
-  dir=$(make_supercase handle)
-  state="$dir/state"
-  printf 'working\n' > "$state/h-routine.status"
-  FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/h-routine.status" "$state"
-  [ -s "$state/.subsuper-escalations" ] && fail "routine signal was escalated by handle_wake"
-  printf 'done: PR 1\n' > "$state/h-done.status"
-  FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/h-done.status" "$state"
-  [ -s "$state/.subsuper-escalations" ] || fail "captain signal was not buffered by handle_wake"
-  pass "handle_wake routes routine->self and captain->escalate"
-}
-
-test_inject_skip_forces_self() {
-  local dir state
-  dir=$(make_supercase skip)
-  state="$dir/state"
-  printf 'done: PR 1\n' > "$state/s1.status"
-  FM_STATE_OVERRIDE="$state" FM_INJECT_SKIP="signal" handle_wake "signal: $state/s1.status" "$state"
-  [ -s "$state/.subsuper-escalations" ] && fail "INJECT_SKIP=signal did not force self-handle"
-  pass "INJECT_SKIP forces self-handle, bypassing captain-relevant classification"
-}
-
-test_is_wake_reason_distinguishes_status_stdout() {
-  # Real wake reasons are recognized; watcher status lines (singleton collision)
-  # are not, so the main loop can idle them without flooding escalations.
-  is_wake_reason "signal: /x/y.status" || fail "signal: not recognized as wake"
-  is_wake_reason "stale: s:fm-x" || fail "stale: not recognized as wake"
-  is_wake_reason "check: /s/c.sh: merged" || fail "check: not recognized as wake"
-  is_wake_reason "heartbeat" || fail "heartbeat not recognized as wake"
-  is_wake_reason "watcher: already running" && fail "singleton status line misclassified as wake"
-  is_wake_reason "watcher: already running pid 123" && fail "singleton status (pid) misclassified as wake"
-  pass "is_wake_reason distinguishes watcher wake reasons from singleton-status stdout"
-}
-
-test_terminal_stale_escalate_leaves_no_marker() {
-  local dir state win key
-  dir=$(make_supercase stale-terminal-nomarker)
-  state="$dir/state"
-  win="sess:fm-fin-n7"
-  printf 'done: PR https://x/y/pull/7\n' > "$state/fin-n7.status"
-  key=$(printf '%s' "fin-n7" | tr ':/.' '___')
-  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
-  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
-  [ -s "$state/.subsuper-escalations" ] || fail "terminal stale was not escalated"
-  [ ! -e "$state/.subsuper-stale-$key" ] || fail "terminal stale left a persistence marker (housekeeping would re-escalate)"
-  : > "$state/.subsuper-escalations"
-  rm -f "$state/.subsuper-last-scan"
-  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "housekeeping re-escalated a terminal stale as a wedge"
-  pass "terminal-stale escalate removes its marker so housekeeping does not re-escalate"
-}
-
-test_signal_escalate_marks_seen_no_catchall_refire() {
-  local dir state key
-  dir=$(make_supercase signal-seen)
-  state="$dir/state"
-  printf 'done: PR https://x/y/pull/8\n' > "$state/sig-t8.status"
-  FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/sig-t8.status" "$state"
-  [ -s "$state/.subsuper-escalations" ] || fail "captain signal was not escalated"
-  key=$(printf '%s' "sig-t8" | tr ':/.' '___')
-  [ "$(cat "$state/.subsuper-seen-status-$key" 2>/dev/null || true)" = "done: PR https://x/y/pull/8" ] \
-    || fail "captain signal escalate did not write the seen-status marker"
-  : > "$state/.subsuper-escalations"
-  rm -f "$state/.subsuper-last-scan"
-  FM_STATE_OVERRIDE="$state" housekeeping "$state"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "catch-all scan re-fired an already-escalated signal"
-  pass "captain signal escalate marks seen so the catch-all scan does not re-fire"
-}
-
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
 test_check_output_is_queued
+test_check_wake_survives_lost_delivery
+test_check_dedup_suppresses_repeats
+test_catch_all_escalates_swallowed_transition
 test_singleton_start
 test_atomic_double_drain
 test_drain_dedupes_obvious_duplicates
@@ -600,19 +459,3 @@ test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warns_on_pending_queue
 test_guard_rearms_after_draining_pending_queue
-# Sub-supervisor (fm-supervise-daemon.sh) classifier + batching + housekeeping.
-test_classify_routine_signal_self
-test_classify_terminal_signal_escalates
-test_classify_check_and_unknown_escalate
-test_stale_transient_self_records_marker
-test_stale_terminal_escalates
-test_housekeeping_persistent_stale_escalates
-test_housekeeping_resumed_stale_cleared
-test_escalate_batches_into_one_digest
-test_escalate_batch_age_uses_first_append
-test_heartbeat_scan_dedup
-test_handle_wake_routes_self_and_escalate
-test_inject_skip_forces_self
-test_is_wake_reason_distinguishes_status_stdout
-test_terminal_stale_escalate_leaves_no_marker
-test_signal_escalate_marks_seen_no_catchall_refire
