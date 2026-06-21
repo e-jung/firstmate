@@ -4,9 +4,13 @@
 # {TASK} placeholder with the task description, acceptance criteria, and context,
 # and may adjust other sections when the task genuinely deviates (e.g. working an
 # existing external PR instead of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--fork-pr]
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --fork-pr overrides the ship contract for an upstream-contribution PR via the
+#   fork: push IS authorized, open/update a cross-repo PR, branch off the fork's
+#   PR branch or origin/main (never local main), do NOT merge. Use for tasks that
+#   push to e-jung/<repo> + PR to the upstream parent.
 # For ship tasks, the definition of done is shaped by the project's delivery mode
 # (data/projects.md via fm-project-mode.sh; see AGENTS.md sections 6-7):
 #   no-mistakes  implement -> /no-mistakes pipeline -> PR -> captain merge (default)
@@ -21,10 +25,12 @@ set -eu
 
 FM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KIND=ship
+FORK_PR=0
 POS=()
 for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
+    --fork-pr) FORK_PR=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -120,6 +126,24 @@ EOF
     ;;
 esac
 
+# --fork-pr overrides the mode-derived contract with the fork-contribution shape
+# (push authorized, cross-repo PR, branch off the fork/origin not local main).
+# Fixes the recurring conflict where fork-PR tasks followed the local-only
+# scaffold and never pushed.
+BRANCH_INSTR="create your branch: \`git checkout -b fm/$ID\`"
+if [ "${FORK_PR:-0}" = 1 ]; then
+  BRANCH_INSTR="set up the fork remote, then create your branch per the task body — base it on the fork's existing PR branch or \`origin/main\` as the task specifies, NOT the project's local \`main\` (local main may carry local-only divergence that would contaminate an upstream PR)"
+  RULE1="1. PUSH IS AUTHORIZED for this task (overrides any default). Push your branch to the fork and open (or update) the cross-repo PR exactly as the task body specifies. Do NOT merge — the maintainer does."
+  DOD=$(cat <<EOF
+# Definition of done
+This task ships as an **upstream contribution PR** via the fork.
+- Branch per the task body (fork's existing PR branch or \`origin/main\` base — never local \`main\`).
+- Push to the fork; open or update the cross-repo PR (full PR template, AI disclosure = Human-reviewed). **Do NOT merge** — the maintainer does.
+When the PR is open/updated, append \`done: PR <full https url>\` to the status file and stop.
+EOF
+)
+fi
+
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -128,7 +152,7 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
-1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+1. First action: $BRANCH_INSTR$SETUP2
 
 # Rules
 $RULE1
