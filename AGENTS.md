@@ -355,7 +355,7 @@ Use chat for yes/no decisions; use lavish-axi when there are multiple findings o
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` in the task's meta and arms the watcher's merge poll.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
-(The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
+(The check contract, for any custom `state/<id>.check.sh` you write yourself: **print the current state every run** (idempotent), e.g. `echo "merged"` while merged. The watcher dedups against `.seen-check-<name>` and enqueues to the durable queue *before* advancing that marker, so a lost stdout or a crashed watcher can never swallow a wake - the same lossless guarantee signals enjoy. Edge-triggered checks that self-suppress via their own `.babysit-*.seen` are tolerated (empty stdout = no wake), but a swallowed transition is only recovered by the watcher's catch-all backstop, so prefer the stateless "always print current state" form. Finish before `FM_CHECK_TIMEOUT`.)
 
 If the captain says "merge it", run `gh-axi pr merge` yourself; that instruction is the explicit approval. If `yolo=on`, merge a green/approved PR yourself and post the required FYI.
 
@@ -389,7 +389,7 @@ From there the task is an ordinary ship task through its mode-specific validatio
 The watcher is the backbone.
 Whenever at least one task is in flight, `bin/fm-watch.sh` must be running as a background task.
 It costs zero tokens while running and exits with one reason line when something needs you.
-It also writes each detected wake to the durable queue at `state/.wake-queue` before advancing suppression markers such as `.seen-*`, `.stale-*`, `.last-check`, or `.last-heartbeat`.
+It also writes each detected wake to the durable queue at `state/.wake-queue` before advancing suppression markers such as `.seen-*`, `.stale-*`, `.seen-check-*`, `.escalated-*`, `.last-check`, or `.last-heartbeat`.
 At the start of every wake-handling turn and every recovery turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 The printed one-shot reason line is still useful, but the drained queue is the lossless backlog.
 After handling drained wakes, re-arm `bin/fm-watch.sh` before you end the turn.

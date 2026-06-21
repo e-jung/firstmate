@@ -4,7 +4,9 @@
 #   signal: <file>...     a crewmate wrote a status line or a turn-end hook fired; signals
 #                         landing within FM_SIGNAL_GRACE of each other coalesce into one wake
 #   stale: <window>       a crewmate pane stopped changing and shows no busy signature
-#   check: <script>: <out> a per-task check script (e.g. merged-PR poll) produced output
+#   check: <script>: <out> a per-task check produced output (deduped by the watcher;
+#                         enqueued before suppression so the wake is lossless), or the
+#                         catch-all force-escalated a swallowed terminal transition
 #   heartbeat              fleet review due; starts at FM_HEARTBEAT and backs off to FM_HEARTBEAT_MAX
 # Run as a background task. Re-arm it after handling each wake; duplicate
 # invocations no-op through the watcher singleton lock.
@@ -71,6 +73,10 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.'}
 hash_pane() {
   if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi
 }
+
+# Collapse a check/sidecar basename into a safe suffix for watcher-side state
+# files (.seen-check-*, .escalated-*). LC_ALL=C so the complement is byte-stable.
+sanitize_name() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'; }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
 # mean an idle fleet, so the heartbeat interval backs off exponentially
@@ -139,17 +145,65 @@ while :; do
   # keeps producing signals - the slow poll (e.g. merge detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
+  #
+  # LOSSLESS CHECK WAKES (the #29 invariant, ported to checks). Checks were the
+  # sole wake source whose suppression lived inside an opaque script: an
+  # edge-triggered check advanced its own .babysit-*.seen marker BEFORE the
+  # print could become a wake, so a lost stdout (timeout / concurrent run /
+  # crash) permanently swallowed the transition - the root cause of the missed
+  # PR #3095 merge. Suppression now lives HERE, in the watcher, with
+  # enqueue-before-suppress - exactly the pattern scan_signals uses:
+  #   * the check always prints its current state (idempotent); the watcher
+  #     dedups against .seen-check-<name> and only wakes on a delta;
+  #   * fm_wake_append (durable queue) happens BEFORE the .seen-check marker
+  #     advances, so a crash between detect and suppress leaves the wake in the
+  #     queue (recovered next turn) and the marker un-advanced (re-detected
+  #     next cycle). A lost check wake is now impossible.
+  # Backward-compatible with old edge-triggered checks: empty stdout never
+  # produces a wake, so they keep their quiet behavior. Any transition they
+  # swallow is caught by the catch-all scan at the end of this block.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
       out=$(run_check "$c")
-      if [ -n "$out" ]; then
+      [ -n "$out" ] || continue
+      sf="$STATE/.seen-check-$(sanitize_name "$(basename "$c")")"
+      if [ "$out" != "$(cat "$sf" 2>/dev/null || true)" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
+        # Test-only hook: prove the wake is durable by simulating a crash
+        # between enqueue and suppress. Never set outside the test suite.
+        [ -n "${FM_WATCH_BREAK_AFTER_CHECK_ENQUEUE:-}" ] && exit 99
+        printf '%s' "$out" > "$sf"
         touch "$STATE/.last-check"
         wake "$reason"
       fi
     done
+
+    # Catch-all backstop: force-escalate any edge-triggered check whose own
+    # .babysit-*.seen sidecar shows a terminal state the watcher never
+    # delivered a wake for. This catches a swallowed transition (sidecar
+    # advanced inside the script but stdout lost) within one sweep - the
+    # belt-and-suspenders safety net for checks that have not migrated to the
+    # lossless "always print current state" contract. Deduped via
+    # .escalated-<sidecar> so each terminal transition fires at most once.
+    for sf in "$STATE"/.babysit-*.seen; do
+      [ -e "$sf" ] || continue
+      terminal=$(cat "$sf" 2>/dev/null || true)
+      state=${terminal%%|*}
+      case "$state" in
+        MERGED|CLOSED) ;;
+        *) continue ;;
+      esac
+      ec="$STATE/.escalated-$(sanitize_name "$(basename "$sf")")"
+      [ "$terminal" = "$(cat "$ec" 2>/dev/null || true)" ] && continue
+      reason="check: catch-all: $sf: $state"
+      fm_wake_append check "$sf" "$reason" || exit 1
+      printf '%s' "$terminal" > "$ec"
+      touch "$STATE/.last-check"
+      wake "$reason"
+    done
+
     touch "$STATE/.last-check"
   fi
 
