@@ -26,6 +26,9 @@ META="$STATE/$ID.meta"
 WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
 T=$(grep '^window=' "$META" | cut -d= -f2-)
 PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
+# tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
+# (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
+TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -105,6 +108,9 @@ if [ -d "$WT" ]; then
 fi
 
 tmux kill-window -t "$T" 2>/dev/null || true
+# Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
+# Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
+[ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts"
 if [ "$KIND" != scout ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
