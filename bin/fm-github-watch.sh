@@ -348,8 +348,11 @@ EOF
   detect_left_open "$open_basenames"
 }
 
-# Detect PRs previously seen as OPEN that no longer appear in the open search
-# (they merged or closed). For each, emit the transition and update its state.
+# Detect PRs that left the open search (merged or closed) since the last poll.
+# For each, emit a state transition and advance its seen state. Only MERGED is
+# terminal: a CLOSED PR can be reopened and later merged, so CLOSED (and OPEN)
+# PRs are re-probed each cycle until they settle to MERGED. Re-probing is
+# bounded by the seen set (PRs once seen open, not yet merged).
 # detect_left_open <open-basenames>  (space-padded: " key1 key2 " so the last
 # entry matches too).
 detect_left_open() {
@@ -359,22 +362,27 @@ detect_left_open() {
   for f in "$SEEN_DIR"/*; do
     [ -e "$f" ] || continue
     base=${f##*/}
+    case "$base" in *.tmp.*) continue ;; esac
     case "$open_basenames" in *" $base "*) continue ;; esac
-    # Only re-check PRs we last recorded as OPEN; merged/closed are settled.
-    seen_state=$(seen_get "$f" state)
     [ -n "$(seen_get "$f" initialized)" ] || continue
-    { [ -z "$seen_state" ] || [ "$seen_state" = "OPEN" ]; } || continue
+    seen_state=$(seen_get "$f" state)
+    [ "$seen_state" = "MERGED" ] && continue   # merged is the only terminal state
     owner=$(seen_get "$f" owner)
     repo=$(seen_get "$f" repo)
     pr=$(seen_get "$f" pr)
     [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$pr" ] || continue
     p_state=$(pr_state "$owner" "$repo" "$pr")
+    [ "$p_state" = "$seen_state" ] && continue   # unchanged: no event, no rewrite
     case "$p_state" in
-      MERGED|CLOSED) ;;
-      *) continue ;;
+      MERGED|CLOSED)
+        # Emit, then advance state (same per-PR losslessness ordering).
+        printf '%s: %s/%s#%s\n' "$p_state" "$owner" "$repo" "$pr"
+        ;;
+      *)
+        # Reopened back to OPEN (or unknown): no event, but track the new state
+        # so a later merge still fires from the right baseline.
+        ;;
     esac
-    # Emit, then advance state (same per-PR losslessness ordering).
-    printf '%s: %s/%s#%s\n' "$p_state" "$owner" "$repo" "$pr"
     block=$(awk -F= -v s="$p_state" '$1!="state" { print } END { print "state=" s }' "$f")
     atomic_write "$f" "$block"
   done
@@ -441,7 +449,8 @@ cmd_status() {
   printf 'poll interval: %ss\n' "$(get_poll)"
   seen_count=0
   if [ -d "$SEEN_DIR" ]; then
-    seen_count=$(find "$SEEN_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+    # Exclude the .tmp staging subdir so leaked temps never inflate the count.
+    seen_count=$(find "$SEEN_DIR" -type f -not -path '*/.tmp/*' 2>/dev/null | wc -l | tr -d ' ')
   fi
   printf 'seen PRs: %s\n' "$seen_count"
 }

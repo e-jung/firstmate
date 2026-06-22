@@ -273,6 +273,35 @@ test_merge_detection_on_left_open() {
   pass "PR leaving the open set as merged emits MERGED once"
 }
 
+test_closed_then_merged_is_not_swallowed() {
+  local dir out sf
+  dir=$(make_case close-merge)
+  seed_prs "$dir" $'kunchenguid/firstmate\t42'
+  printf 'OPEN\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  sf="$dir/state/.github-watch-seen/kunchenguid-firstmate-42"
+  run_poll "$dir" >/dev/null   # baseline OPEN
+
+  # PR is closed (leaves the open set): emit CLOSED once.
+  : > "$dir/fixture/prs"
+  printf 'CLOSED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CLOSED: kunchenguid/firstmate#42" \
+    || fail "open->closed did not emit; got: $out"
+
+  # Steady closed: must NOT re-emit CLOSED every cycle.
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CLOSED" && fail "CLOSED re-emitted while settled" || true
+
+  # Closed -> reopened -> merged all between polls: MERGED must still fire
+  # (CLOSED is not terminal; the watcher re-probes it).
+  printf 'MERGED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "MERGED: kunchenguid/firstmate#42" \
+    || fail "close->merge transition was swallowed; got: $out"
+
+  pass "CLOSED is treated as non-terminal: close->merge still emits MERGED"
+}
+
 test_config_roundtrip() {
   local dir
   dir=$(make_case config)
@@ -415,6 +444,7 @@ test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
 test_losslessness_redetects_when_seen_write_fails
 test_merge_detection_on_left_open
+test_closed_then_merged_is_not_swallowed
 test_config_roundtrip
 test_review_detection
 test_ci_detection
