@@ -118,9 +118,12 @@ GH
 }
 
 # run_poll <case-dir> : invoke one poll cycle with the fake gh on PATH.
+# A known contributor is pinned via env so discovery proceeds even though the
+# fake gh does not implement `api user`.
 run_poll() {
   local dir=$1
   PATH="$dir/fakebin:$PATH" GH_FIXTURE="$dir/fixture" \
+    FM_GH_CONTRIBUTOR=e-jung \
     FM_STATE_OVERRIDE="$dir/state" \
     bash "$GH_WATCH" --once
 }
