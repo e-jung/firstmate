@@ -25,11 +25,12 @@
 # Config: state/.github-watch-config (key=value lines).
 # Seen:   state/.github-watch-seen/<owner>-<repo>-<pr> (key=value lines).
 #
-# Losslessness: seen markers are written ONLY as the last action of a poll,
-# after every event line has already been emitted. A crash between print and
-# the seen write at worst causes a redundant re-detect next cycle, never a
-# permanent swallow. A failing seen write leaves the old marker in place, so
-# the same event fires again next cycle.
+# Losslessness: for each PR, events are emitted BEFORE its seen marker advances
+# (and bash's builtin printf write()s to the capture pipe immediately, so an
+# emitted event survives even a SIGKILL). A crash between the print and the seen
+# write at worst causes a redundant re-detect next cycle, never a permanent
+# swallow. A failing seen write leaves the old marker in place, so the same
+# event fires again next cycle.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -177,119 +178,141 @@ ci_signature() {
 
 # ---- the poll ----
 
-# Emit one poll cycle. Events for ALL prs are accumulated in memory, printed in
-# a single burst, and only then are seen markers advanced — so a crash can never
-# advance a marker past an event that was not yet emitted.
+# atomic_write <file> <content> — write seen state via temp + rename so a crash
+# or a read-only state dir can never leave a partial file. On any failure the
+# prior file is left untouched, so the event re-fires next cycle (lossless).
+atomic_write() {
+  local file=$1 content=$2 tmp
+  tmp="$file.tmp.$$"
+  # Redirect fd 2 to /dev/null BEFORE the output redirect so a failure to open
+  # the temp (read-only dir) is reported to /dev/null, not the terminal.
+  if printf '%s\n' "$content" 2>/dev/null > "$tmp"; then
+    mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
+}
+
+# build_seen <prior-seen-file> <owner> <repo> <pr> <c_count> <r_count> <ci_sig> <sha> <p_state>
+# Compose the seen-state block: high-water marks for counts, current value for
+# ci/state. Fields with no fresh value this cycle are carried forward from the
+# prior block, so toggling a filter off never wipes its remembered high-water.
+build_seen() {
+  local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_sig=$7 sha=$8 p_state=$9
+  local seen_c seen_r new_c new_r block
+  seen_c=$(seen_get "$sf" comments)
+  seen_r=$(seen_get "$sf" reviews)
+  new_c=$seen_c; new_r=$seen_r
+  if is_int "$c_count"; then
+    if is_int "$seen_c"; then new_c=$((seen_c > c_count ? seen_c : c_count)); else new_c=$c_count; fi
+  fi
+  if is_int "$r_count"; then
+    if is_int "$seen_r"; then new_r=$((seen_r > r_count ? seen_r : r_count)); else new_r=$r_count; fi
+  fi
+  block=$(printf 'owner=%s\nrepo=%s\npr=%s\ninitialized=1' "$owner" "$repo" "$pr")
+  is_int "$new_c"   && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
+  is_int "$new_r"   && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
+  [ -n "$ci_sig" ]  && block=$(printf '%s\nci=%s'       "$block" "$ci_sig")
+  [ -n "$sha" ]     && block=$(printf '%s\nsha=%s'      "$block" "$sha")
+  [ -n "$p_state" ] && block=$(printf '%s\nstate=%s'    "$block" "$p_state")
+  printf '%s' "$block"
+}
+
+# process_pr <owner> <repo> <pr> <contributor>
+# Gather fresh data for the enabled filters, EMIT any new events for this PR,
+# then advance this PR's seen marker. Per-PR ordering (print before seen) plus
+# bash's immediate write() to the capture pipe make this lossless even if the
+# poll is killed mid-cycle: an emitted event is already in the pipe, and a PR
+# whose marker never advanced simply re-fires next cycle. Emitting per-PR (not
+# all-at-end) also means a watcher timeout surfaces partial progress instead of
+# nothing — important because the watcher wraps check scripts in a 30s timeout
+# and a full fleet poll of serial gh calls can approach that budget.
+process_pr() {
+  local owner=$1 repo=$2 pr=$3 contributor=$4
+  local sf c_count r_count p_state sha ci_sig
+  local initialized seen_c seen_r seen_state seen_ci ev=""
+  sf=$(seen_file "$owner" "$repo" "$pr")
+
+  c_count="" r_count="" p_state="" sha="" ci_sig=""
+  filter_enabled comments && c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor")
+  filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr")
+  filter_enabled merge    && p_state=$(pr_state "$owner" "$repo" "$pr")
+  if filter_enabled ci; then
+    sha=$(head_sha "$owner" "$repo" "$pr")
+    ci_sig=$(ci_signature "$owner" "$repo" "$sha")
+  fi
+
+  initialized=$(seen_get "$sf" initialized)
+  if [ -n "$initialized" ]; then
+    seen_c=$(seen_get "$sf" comments)
+    seen_r=$(seen_get "$sf" reviews)
+    seen_state=$(seen_get "$sf" state)
+    seen_ci=$(seen_get "$sf" ci)
+
+    # comments (high-water): event on increase only.
+    if is_int "$c_count" && is_int "$seen_c" && [ "$c_count" -gt "$seen_c" ]; then
+      ev="${ev}COMMENT: ${owner}/${repo}#${pr} has $((c_count - seen_c)) new maintainer comment(s)
+"
+    fi
+    # reviews (high-water): event on increase only.
+    if is_int "$r_count" && is_int "$seen_r" && [ "$r_count" -gt "$seen_r" ]; then
+      ev="${ev}REVIEW: ${owner}/${repo}#${pr} has $((r_count - seen_r)) new review(s)
+"
+    fi
+    # ci: event on any signature change.
+    if [ -n "$ci_sig" ] && [ -n "$seen_ci" ] && [ "$seen_ci" != "$ci_sig" ]; then
+      ev="${ev}CI: ${owner}/${repo}#${pr} checks changed
+"
+    fi
+    # merge: event on open -> merged/closed transition.
+    if [ -n "$p_state" ] && [ "$p_state" != "$seen_state" ]; then
+      case "$p_state" in
+        MERGED) [ "${seen_state:-OPEN}" = "OPEN" ] && ev="${ev}MERGED: ${owner}/${repo}#${pr}
+" ;;
+        CLOSED) [ "${seen_state:-OPEN}" = "OPEN" ] && ev="${ev}CLOSED: ${owner}/${repo}#${pr}
+" ;;
+      esac
+    fi
+  fi
+
+  # --- LOSSLESSNESS BOUNDARY (per-PR) ---
+  # Emit this PR's events first (bash's printf write()s to the pipe at once),
+  # then advance its seen marker. A crash between the two leaves the event
+  # delivered and the marker stale -> a redundant re-detect, never a swallow.
+  [ -n "$ev" ] && printf '%s' "$ev"
+  local block
+  block=$(build_seen "$sf" "$owner" "$repo" "$pr" "$c_count" "$r_count" "$ci_sig" "$sha" "$p_state")
+  atomic_write "$sf" "$block"
+}
+
+# Emit one poll cycle.
 poll_once() {
-  local contributor prs EVENTS="" pending
+  local contributor prs fullname pr owner repo basename
+  local open_basenames=" "
   contributor=$(get_contributor)
   prs=$(discover_prs)
-
-  # Staged seen updates: written to a scratch dir during the loop, moved into
-  # place only AFTER events are printed (the last action of the poll).
-  pending=$(mktemp -d "${TMPDIR:-/tmp}/fm-ghwatch.XXXXXX")
-
-  local fullname pr owner repo sf basename initialized
-  local c_count r_count p_state sha ci_sig
-  local seen_c seen_r seen_state seen_ci new_c new_r
-  local open_basenames=""
-  local block
 
   while IFS=$'\t' read -r fullname pr; do
     [ -n "${fullname:-}" ] || continue
     owner=${fullname%%/*}
     repo=${fullname#*/}
     { [ -n "$owner" ] && [ -n "$repo" ] && [ "$owner" != "$fullname" ] && [ -n "${pr:-}" ]; } || continue
-
-    sf=$(seen_file "$owner" "$repo" "$pr")
-    basename=${sf##*/}
-    open_basenames="$open_basenames $basename"
-
-    # Gather fresh data only for enabled filters.
-    c_count="" r_count="" p_state="" sha="" ci_sig=""
-    filter_enabled comments && c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor")
-    filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr")
-    filter_enabled merge    && p_state=$(pr_state "$owner" "$repo" "$pr")
-    if filter_enabled ci; then
-      sha=$(head_sha "$owner" "$repo" "$pr")
-      ci_sig=$(ci_signature "$owner" "$repo" "$sha")
-    fi
-
-    initialized=$(seen_get "$sf" initialized)
-    seen_c="" seen_r="" seen_state="" seen_ci=""
-    block=$(printf 'owner=%s\nrepo=%s\npr=%s\ninitialized=1\n' "$owner" "$repo" "$pr")
-
-    if [ -z "$initialized" ]; then
-      # First sight of this PR: baseline silently (no events).
-      :
-    else
-      seen_c=$(seen_get "$sf" comments)
-      seen_r=$(seen_get "$sf" reviews)
-      seen_state=$(seen_get "$sf" state)
-      seen_ci=$(seen_get "$sf" ci)
-
-      # comments (high-water): event on increase only.
-      if is_int "$c_count" && is_int "$seen_c" && [ "$c_count" -gt "$seen_c" ]; then
-        EVENTS="${EVENTS}COMMENT: ${fullname}#${pr} has $((c_count - seen_c)) new maintainer comment(s)
-"
-      fi
-      # reviews (high-water): event on increase only.
-      if is_int "$r_count" && is_int "$seen_r" && [ "$r_count" -gt "$seen_r" ]; then
-        EVENTS="${EVENTS}REVIEW: ${fullname}#${pr} has $((r_count - seen_r)) new review(s)
-"
-      fi
-      # ci: event on any signature change.
-      if [ -n "$ci_sig" ] && [ -n "$seen_ci" ] && [ "$seen_ci" != "$ci_sig" ]; then
-        EVENTS="${EVENTS}CI: ${fullname}#${pr} checks changed
-"
-      fi
-      # merge: event on open -> merged/closed transition.
-      if [ -n "$p_state" ] && [ "$p_state" != "$seen_state" ]; then
-        case "$p_state" in
-          MERGED) [ "${seen_state:-OPEN}" = "OPEN" ] && EVENTS="${EVENTS}MERGED: ${fullname}#${pr}
-" ;;
-          CLOSED) [ "${seen_state:-OPEN}" = "OPEN" ] && EVENTS="${EVENTS}CLOSED: ${fullname}#${pr}
-" ;;
-        esac
-      fi
-    fi
-
-    # Build the staged seen block: high-water for counts, current for ci/state.
-    new_c=$seen_c; new_r=$seen_r
-    if is_int "$c_count"; then
-      if is_int "$seen_c"; then new_c=$((seen_c > c_count ? seen_c : c_count)); else new_c=$c_count; fi
-    fi
-    if is_int "$r_count"; then
-      if is_int "$seen_r"; then new_r=$((seen_r > r_count ? seen_r : r_count)); else new_r=$r_count; fi
-    fi
-    is_int "$new_c"  && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
-    is_int "$new_r"  && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
-    [ -n "$ci_sig" ] && block=$(printf '%s\nci=%s'       "$block" "$ci_sig")
-    [ -n "$sha" ]    && block=$(printf '%s\nsha=%s'      "$block" "$sha")
-    [ -n "$p_state" ] && block=$(printf '%s\nstate=%s'   "$block" "$p_state")
-    printf '%s\n' "$block" > "$pending/$basename"
+    process_pr "$owner" "$repo" "$pr" "$contributor"
+    basename=$(seen_file "$owner" "$repo" "$pr"); basename=${basename##*/}
+    open_basenames="${open_basenames}${basename} "
   done <<EOF
 $prs
 EOF
 
-  # Merge/close detection for PRs that left the open set since last poll.
-  detect_left_open "$pending" "$open_basenames"
-
-  # --- LOSSLESSNESS BOUNDARY ---
-  # All events are emitted FIRST. Seen markers are advanced ONLY afterward.
-  if [ -n "$EVENTS" ]; then
-    printf '%s' "$EVENTS"
-  fi
-
-  # Last action of the poll: advance seen markers.
-  apply_pending "$pending"
-  rm -rf "$pending"
+  detect_left_open "$open_basenames"
 }
 
-# Detect PRs previously seen as OPEN that no longer appear in the open search.
-# detect_left_open <pending-dir> <space-separated open basenames>
+# Detect PRs previously seen as OPEN that no longer appear in the open search
+# (they merged or closed). For each, emit the transition and update its state.
+# detect_left_open <open-basenames>  (space-padded: " key1 key2 " so the last
+# entry matches too).
 detect_left_open() {
-  local pending=$1 open_basenames=$2 f base owner repo pr seen_state p_state
+  local open_basenames=$1 f base owner repo pr seen_state p_state block
   [ -d "$SEEN_DIR" ] || return 0
   for f in "$SEEN_DIR"/*; do
     [ -e "$f" ] || continue
@@ -305,35 +328,13 @@ detect_left_open() {
     [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$pr" ] || continue
     p_state=$(pr_state "$owner" "$repo" "$pr")
     case "$p_state" in
-      MERGED) EVENTS="${EVENTS:-}MERGED: ${owner}/${repo}#${pr}
-" ;;
-      CLOSED) EVENTS="${EVENTS:-}CLOSED: ${owner}/${repo}#${pr}
-" ;;
+      MERGED|CLOSED) ;;
       *) continue ;;
     esac
-    # Carry forward prior seen fields, updating only state.
-    carry_seen_forward "$pending" "$base" "$f" "$p_state"
-  done
-}
-
-# carry_seen_forward <pending-dir> <basename> <real-seen-file> <new-state>
-# Reproduce the PR's current seen block with the state field replaced, into the
-# pending dir, so a left-open PR's marker advances atomically with the rest.
-carry_seen_forward() {
-  local pending=$1 base=$2 real=$3 newstate=$4
-  awk -F= -v s="$newstate" '$1!="state" { print } END { print "state=" s }' \
-    "$real" > "$pending/$base"
-}
-
-# apply_pending <dir> — atomically move each staged seen file into place.
-# A failed move (e.g. read-only state dir) is non-fatal: the seen marker simply
-# stays at its prior value and the event re-fires next cycle (lossless).
-apply_pending() {
-  local dir=$1 f
-  [ -d "$dir" ] || return 0
-  for f in "$dir"/*; do
-    [ -e "$f" ] || continue
-    mv -f "$f" "$SEEN_DIR/${f##*/}" 2>/dev/null || true
+    # Emit, then advance state (same per-PR losslessness ordering).
+    printf '%s: %s/%s#%s\n' "$p_state" "$owner" "$repo" "$pr"
+    block=$(awk -F= -v s="$p_state" '$1!="state" { print } END { print "state=" s }' "$f")
+    atomic_write "$f" "$block"
   done
 }
 
@@ -404,7 +405,9 @@ cmd_status() {
 }
 
 usage() {
-  sed -n '2,/^$/p' < "$0" | sed 's/^# \{0,1\}//'
+  # Print the leading `#` header comment (lines 2..) up to the first non-comment
+  # line, stripping the `# ` prefix. Stops before `set -u` so no code leaks.
+  awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 # ---- entry ----

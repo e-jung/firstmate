@@ -292,9 +292,55 @@ test_config_roundtrip() {
   pass "config writes round-trip across contributor + filter subcommands"
 }
 
+test_review_detection() {
+  local dir out sf
+  dir=$(make_case review)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t310'
+  printf '1\n' > "$dir/fixture/reviews-kunchenguid-no-mistakes-310"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-310"
+
+  run_poll "$dir" >/dev/null
+  grep -Fxq "reviews=1" "$sf" || fail "baseline reviews not set"
+
+  printf '3\n' > "$dir/fixture/reviews-kunchenguid-no-mistakes-310"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "REVIEW: kunchenguid/no-mistakes#310 has 2 new review(s)" \
+    || fail "review increase did not emit event; got: $out"
+  grep -Fxq "reviews=3" "$sf" || fail "review high-water not advanced"
+
+  pass "review count increase emits REVIEW event"
+}
+
+test_ci_detection() {
+  local dir out sf
+  dir=$(make_case ci)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t310'
+  printf 'abcdef1\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
+  printf 'success,success,success\n' > "$dir/fixture/ci-abcdef1"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-310"
+
+  run_poll "$dir" >/dev/null
+  grep -Fxq "ci=success,success,success" "$sf" || fail "baseline ci signature not set"
+
+  # A check goes red: signature changes.
+  printf 'failure,success,success\n' > "$dir/fixture/ci-abcdef1"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 checks changed" \
+    || fail "ci signature change did not emit event; got: $out"
+  grep -Fxq "ci=failure,success,success" "$sf" || fail "ci signature not advanced"
+
+  # Steady state again: silence.
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "steady-state ci poll should be silent; got: $out"
+
+  pass "CI signature change emits CI event"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
 test_losslessness_redetects_when_seen_write_fails
 test_merge_detection_on_left_open
 test_config_roundtrip
+test_review_detection
+test_ci_detection
