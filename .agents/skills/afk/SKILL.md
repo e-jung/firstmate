@@ -73,10 +73,24 @@ travels with the message text; it does not rely on harness-level
 typed-vs-injected detection (which is not portable across claude, codex,
 opencode, and pi).
 
-## Busy-guard
+## Busy-guard and composer guard
 
-The daemon never injects into an in-use pane: it checks `pane_is_busy` on the
-supervisor pane before injecting and defers if firstmate is mid-turn. In afk
-mode this is belt-and-suspenders (no human is typing), but it protects against
-the daemon's own escalation arriving while firstmate is processing the
-previous one.
+The daemon never injects into an in-use pane. Two checks run before every
+injection:
+
+- **`pane_is_busy`** — the harness shows a busy footer (agent mid-turn).
+- **`pane_input_pending`** — the cursor line has non-empty content (a human's
+  half-typed line, or a previous injection whose Enter was swallowed).
+
+Either condition defers the injection; the buffered escalation survives in
+`state/.subsuper-escalations` and is retried on the next housekeeping tick. In
+afk mode the composer guard is belt-and-suspenders (no human is typing), but it
+protects against the race window between the captain returning and their
+message landing, and against the daemon's own previous injection sitting unsent.
+
+## Submit model
+
+The daemon types the digest **once** via `send-keys -l`, then submits with
+Enter. If the composer still has text after Enter (swallowed Enter), it retries
+**Enter only** (never retypes the digest), preventing concatenation of two
+sentinel-prefixed digests into one corrupted turn.

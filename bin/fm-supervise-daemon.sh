@@ -45,8 +45,9 @@
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
 #
 # The robustness shell from the prior always-inject version is preserved:
-# single-instance flock, crash-loop backoff, pane-gone guard, and a
-# signal-trapped shutdown that flushes buffered escalations before exit.
+# single-instance lock (portable mkdir-based, no flock dependency), crash-loop
+# backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
+# escalations before exit.
 #
 # Usage: fm-supervise-daemon.sh
 #          Long-lived background loop. Normally started by the /afk skill, which
@@ -68,11 +69,17 @@
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
 #                                   the watcher is mid-cycle (default 15)
 #          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
-#          FM_INJECT_CONFIRM_RETRIES send-keys verify retries (default 3)
+#          FM_COMPOSER_IDLE_RE       regex matching an empty composer (idle
+#                                   prompt); non-match on the cursor line means
+#                                   pending input (default: bare prompts + busy
+#                                   footers)
+#          FM_INJECT_CONFIRM_RETRIES Enter-retry attempts on a swallowed Enter
+#                                   (default 3); the digest is typed once, only
+#                                   Enter is retried
 #          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
-#          instance via flock on state/.supervise-daemon.lock. Trapped
+#          instance via portable mkdir lock on state/.supervise-daemon.lock. Trapped
 #          SIGTERM/SIGINT shut down within ~1s, flush escalations, release the
 #          lock. A crashing fm-watch.sh is logged and restarted, never killing
 #          the daemon; a tight crash-restart spin is detected and backed off.
@@ -91,6 +98,13 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # interrupt"; opencode: "esc interrupt"; pi: "Working...".
 BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.'
 CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
+# Patterns that indicate an EMPTY composer (idle pane, no pending input). Used by
+# pane_input_pending to distinguish "bare prompt, nothing typed" from "human
+# mid-typing." The cursor/input line is checked against this regex: a match means
+# the composer is empty (safe to inject); a non-match with non-whitespace content
+# means there is pending input (defer). Err on the side of treating unrecognized
+# content as pending (false positives are cheap — just a deferred cycle).
+COMPOSER_IDLE_RE_DEFAULT='^[[:space:]]*(\$|>|❯|%|#)[[:space:]]*$|esc (to )?interrupt|Working\.\.\.'
 INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
@@ -182,6 +196,15 @@ message_is_injection() {  # <message-text>
   return 1
 }
 
+# strip_injection_marker: remove the leading sentinel marker (if present) so the
+# digest text is clean for classification/relay. The afk-exit contract keys off
+# the marker's PRESENCE; once detected, the marker byte should not appear in the
+# distilled content firstmate relays to the captain or feeds back to classifiers.
+strip_injection_marker() {  # <message-text>
+  local msg=$1
+  printf '%s' "${msg#"$FM_INJECT_MARK"}"
+}
+
 # Collapse all newlines to a literal " - " separator so the injected digest is
 # a single line. Submission via send-keys + Enter is then unambiguous regardless
 # of how the target TUI handles embedded newlines in its composer.
@@ -239,28 +262,50 @@ window_to_task() {
 # summary firstmate would otherwise have to re-read.
 
 classify_signal() {  # <reason-after-colon> <state>
-  local reason=$1 state=$2 f last distilled="" rel=""
+  local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
-    status_is_captain_relevant "$last" && rel=1
+    status_is_captain_relevant "$last" || continue
+    rel=1
+    # Dedupe against the catch-all scan: if this status was already escalated
+    # (seen marker matches), skip escalating again. The seen marker is the
+    # single source of truth shared between the per-wake signal path and the
+    # heartbeat scan. all_seen stays 1 only if EVERY relevant file was seen.
+    task=$(basename "$f"); task="${task%.status}"
+    seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
+    [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
-  if [ -n "$rel" ]; then printf 'escalate|%s' "$distilled"
-  else printf 'self|routine signal: %s' "$distilled"; fi
+  if [ -z "$rel" ]; then
+    printf 'self|routine signal: %s' "$distilled"
+  elif [ "$all_seen" = "1" ]; then
+    # Every relevant status was already escalated by the catch-all scan;
+    # self-handle to avoid a duplicate entry in the digest.
+    printf 'self|signal already escalated (catch-all scan): %s' "$distilled"
+  else
+    printf 'escalate|%s' "$distilled"
+  fi
 }
 
 # classify_stale decides the WAKE itself (one-shot per distinct hash). On a
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last
+  local win=$1 state=$2 task last seen
   task=$(window_to_task "$win")
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
+    # Dedupe against the signal path: if this status was already escalated
+    # (seen marker matches), self-handle to avoid a duplicate in the digest.
+    seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
+    if [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ]; then
+      printf 'self|stale + terminal (already escalated by signal): %s' "$last"
+      return
+    fi
     printf 'escalate|stale + terminal status: %s' "$last"
     return
   fi
@@ -343,6 +388,33 @@ pane_is_busy() {  # <window>
   tail40=$(tmux capture-pane -p -t "$win" -S -40 2>/dev/null) || return 1
   printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
     | grep -qiE "${FM_BUSY_REGEX:-$BUSY_REGEX_DEFAULT}"
+}
+
+# pane_input_pending: detect non-empty text on the cursor/input line. Returns 0
+# (pending) if the cursor line has non-whitespace content that is NOT a
+# recognized idle pattern (bare prompt, busy footer).
+# This catches:
+#   - A human's half-typed line (no Enter submitted yet) — the race window
+#     between the captain returning and their message landing.
+#   - A previous injection whose Enter was swallowed (text sits unsent).
+# In both cases injecting would corrupt the shared input channel (merge or
+# concatenate). The safe action is to defer and retry next cycle.
+# FM_COMPOSER_IDLE_RE overrides the idle pattern (extended regex).
+pane_input_pending() {  # <target>
+  local target=$1 cy pane_out line
+  # Get the cursor's Y position (0-indexed from the top of the visible pane).
+  cy=$(tmux display-message -p -t "$target" '#{cursor_y}' 2>/dev/null) || return 1
+  case "$cy" in ''|*[!0-9]*) return 1 ;; esac
+  # Capture the full visible pane and extract the cursor line (sed is 1-indexed).
+  pane_out=$(tmux capture-pane -p -t "$target" 2>/dev/null) || return 1
+  line=$(printf '%s\n' "$pane_out" | sed -n "$((cy + 1))p")
+  # Strip trailing whitespace (the cursor position is not "content").
+  line="${line%"${line##*[![:space:]]}"}"
+  # Blank line = empty composer = not pending.
+  [ -n "$line" ] || return 1
+  # A recognized idle pattern (bare prompt, busy footer) = empty composer.
+  printf '%s' "$line" | grep -qiE "${FM_COMPOSER_IDLE_RE:-$COMPOSER_IDLE_RE_DEFAULT}" && return 1
+  return 0
 }
 
 escalate_add() {  # <state> <distilled-item>
@@ -453,12 +525,23 @@ window_for_task() {  # <task-key>
 
 # --- injection --------------------------------------------------------------
 # inject_msg: send one escalation digest to the supervisor pane.
-# Returns 0 on successful inject, non-zero if the pane is gone, the supervisor
-# is busy, afk is inactive, or the turn-started confirmation fails after
-# bounded retries. On non-zero the caller preserves the buffer so the
-# escalation survives for the next cycle or the catch-up flush.
+# Returns 0 on successful inject (or empty buffer), non-zero if the pane is
+# gone, the supervisor is busy, afk is inactive, or the turn-started
+# confirmation fails after bounded retries. On non-zero the caller preserves
+# the buffer so the escalation survives for the next cycle or the catch-up flush.
+#
+# Submit model (the two HIGH fixes from the maintainer's review):
+#   - TYPE ONCE, then submit with Enter. Never retype the digest: a swallowed
+#     Enter leaves our text in the composer, and retyping would concatenate two
+#     sentinel-prefixed digests into one corrupted turn.
+#   - SUBMIT ACK = the composer is empty after Enter. pane_input_pending checks
+#     the cursor line: empty means the text was consumed (submit succeeded);
+#     non-empty means Enter was swallowed (retry Enter only, not retype).
+#   - COMPOSER GUARD before typing: if the cursor line already has content (a
+#     human's half-typed line, or a previous injection's unsent text), defer
+#     entirely — injecting would merge with the human's text.
 inject_msg() {  # <message> [state]
-  local msg=$1 state target i before after retries sleep_s
+  local msg=$1 state target i retries sleep_s
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the base one-shot
@@ -472,36 +555,41 @@ inject_msg() {  # <message> [state]
   msg="${FM_INJECT_MARK}${msg}"
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1 || return 1
-  # (3) Busy-guard: never inject into an in-use pane. Defer; the buffered
-  # escalation survives in state/.subsuper-escalations. In afk mode this is
-  # belt-and-suspenders (no human is typing), but it also protects against
-  # firstmate being mid-turn when the escalation fires.
+  # (3) Busy-guard: never inject into an in-use pane. Two checks:
+  #   a) pane_is_busy: the harness shows a busy footer (agent mid-turn).
+  #   b) pane_input_pending: the cursor line has non-empty content (a human's
+  #      half-typed line, or a previous injection whose Enter was swallowed).
+  # Both defer; the buffered escalation survives for the next cycle.
   if pane_is_busy "$target"; then
-    log "inject deferred: supervisor pane busy"
+    log "inject deferred: supervisor pane busy (agent mid-turn)"
     return 1
   fi
-  # (4) Turn-started confirmation: verify the pane content changed after
-  # Enter. A swallowed Enter (popup, focus elsewhere) must not lose the
-  # escalation silently; retry with bounded attempts.
+  if pane_input_pending "$target"; then
+    log "inject deferred: supervisor pane has pending input (non-empty composer)"
+    return 1
+  fi
+  # (4) Type the digest ONCE, then submit with Enter. Retry Enter only (never
+  # retype) so a swallowed Enter does not concatenate digests in an uncleared
+  # composer. Submit success = the composer is empty after Enter (the text was
+  # consumed); submit failure = the composer still has our text (Enter swallowed).
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
+  if ! tmux send-keys -t "$target" -l "$msg" 2>/dev/null; then
+    log "inject failed: send-keys -l returned non-zero"
+    return 1
+  fi
+  sleep "$sleep_s"
   i=0
   while [ "$i" -lt "$retries" ]; do
     i=$((i + 1))
-    before=$(tmux capture-pane -p -t "$target" -S -5 2>/dev/null | tail -3) || before=""
-    if tmux send-keys -t "$target" -l "$msg" 2>/dev/null; then
-      sleep "$sleep_s"
-      if tmux send-keys -t "$target" Enter 2>/dev/null; then
-        sleep "$sleep_s"
-        after=$(tmux capture-pane -p -t "$target" -S -5 2>/dev/null | tail -3) || after=""
-        if [ "$before" != "$after" ]; then
-          return 0
-        fi
-      fi
-    fi
+    tmux send-keys -t "$target" Enter 2>/dev/null || true
     sleep "$sleep_s"
+    if ! pane_input_pending "$target"; then
+      return 0  # Composer cleared → submit succeeded.
+    fi
+    # Enter was swallowed (text still in composer). Retry Enter, not retype.
   done
-  log "inject failed after $retries retries (pane content unchanged)"
+  log "inject failed: Enter swallowed after $retries retries (text in composer)"
   return 1
 }
 
@@ -594,6 +682,10 @@ fm_super_main() {
   STATE="$(_state_root)"
   mkdir -p "$STATE"
 
+  # Source the portable lock helpers (mkdir-based, works on macOS where flock
+  # is absent). Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
+  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
+
   local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
   local LOG="$STATE/.supervise-daemon.log"
   local WATCH_ERR="$STATE/.supervise-daemon.watcher.err"
@@ -607,10 +699,13 @@ fm_super_main() {
 
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 
-  # --- single instance (fd 9 flock) ----------------------------------------
-  exec 9>"$LOCK"
-  if ! flock -n 9; then
-    echo "error: another fm-supervise-daemon is already running (lock $LOCK held)" >&2
+  # --- single instance (portable mkdir-based lock, no flock dependency) ------
+  if ! fm_lock_try_acquire "$LOCK"; then
+    if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
+      echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
+    else
+      echo "error: another fm-supervise-daemon is already running (lock $LOCK held)" >&2
+    fi
     exit 1
   fi
   echo "$$" > "$PIDFILE"
@@ -620,12 +715,19 @@ fm_super_main() {
   # pane that launched the daemon, normally firstmate's own) > firstmate:0
   # fallback. Exporting the result into FM_SUPERVISOR_TARGET makes inject_msg
   # (which reads that env var) use the discovered pane without an extra global.
-  local discovered fallback
+  local discovered target_source
+  target_source="FM_SUPERVISOR_TARGET"
+  if [ -z "${FM_SUPERVISOR_TARGET:-}" ]; then
+    if [ -n "${TMUX_PANE:-}" ]; then
+      target_source="TMUX_PANE"
+    else
+      target_source="FALLBACK(firstmate:0)"
+    fi
+  fi
   if discovered=$(discover_supervisor_target); then
-    : # explicit override or TMUX_PANE — resolved cleanly
+    : # resolved cleanly
   else
-    fallback="$discovered"
-    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET or TMUX_PANE); falling back to '$fallback'" >&2
+    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET or TMUX_PANE); falling back to '$discovered' — verify this is firstmate's pane" >&2
   fi
   FM_SUPERVISOR_TARGET="$discovered"
   local TARGET="$FM_SUPERVISOR_TARGET"
@@ -634,13 +736,14 @@ fm_super_main() {
   if ! tmux display-message -p -t "$TARGET" '#{pane_id}' >/dev/null 2>&1; then
     echo "error: supervisor target '$TARGET' does not resolve to a tmux pane; set FM_SUPERVISOR_TARGET" >&2
     log "startup failed: target '$TARGET' not found"
+    fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
     exit 1
   fi
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
@@ -654,6 +757,7 @@ fm_super_main() {
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
     fi
+    fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
     log "daemon shutting down"
     exit 0
@@ -682,9 +786,7 @@ fm_super_main() {
 
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    # 9>&- closes the flock fd in the child so orphaned grandchildren cannot
-    # outlive the daemon and hold the lock (same property as the prior daemon).
-    "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" 9>&- &
+    "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
     WATCHER_PID=$!
   }
 

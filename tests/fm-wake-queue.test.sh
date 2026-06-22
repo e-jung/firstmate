@@ -76,6 +76,10 @@ set -u
 case "${1:-}" in
   display-message)
     [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] || exit 1
+    # Return cursor_y when the format asks for it (pane_input_pending).
+    for _a in "$@"; do
+      case "$_a" in *cursor_y*) printf '%s\n' "${FM_FAKE_TMUX_CURSOR_Y:-0}"; exit 0 ;; esac
+    done
     printf 'fakepane\n'; exit 0 ;;
   list-windows)
     [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
@@ -88,11 +92,25 @@ case "${1:-}" in
       case "$1" in
         -l) shift; [ "$#" -gt 0 ] && {
           printf '%s\n' "$1" >> "${FM_FAKE_TMUX_SENT:-/dev/null}"
-          # Reflect sent text into capture so inject_msg's turn-started
-          # confirmation (before != after) sees a content change.
+          # Reflect sent text into capture so pane_input_pending sees it as
+          # pending input (text in the composer).
           [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ] && printf '%s\n' "$1" >> "$FM_FAKE_TMUX_CAPTURE"
         } ;;
-        Enter) printf '[ENTER]\n' >> "${FM_FAKE_TMUX_SENT:-/dev/null}" ;;
+        Enter)
+          # Optionally swallow Enter (file-based flag) to test the retry path.
+          if [ -n "${FM_FAKE_TMUX_SWALLOW_FILE:-}" ] && [ -f "$FM_FAKE_TMUX_SWALLOW_FILE" ]; then
+            rm -f "$FM_FAKE_TMUX_SWALLOW_FILE"
+          else
+            printf '[ENTER]\n' >> "${FM_FAKE_TMUX_SENT:-/dev/null}"
+            # Enter submits: clear the last line (the typed text) from the
+            # capture, simulating the composer being cleared on submit.
+            if [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ] && [ -s "$FM_FAKE_TMUX_CAPTURE" ]; then
+              _tmp=$(mktemp 2>/dev/null) || _tmp="${FM_FAKE_TMUX_CAPTURE}.tmp"
+              sed '$d' "$FM_FAKE_TMUX_CAPTURE" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$FM_FAKE_TMUX_CAPTURE"
+              rm -f "$_tmp" 2>/dev/null
+            fi
+          fi
+          ;;
       esac
       shift
     done
@@ -742,6 +760,190 @@ test_should_exit_afk_when_afk_inactive() {
   pass "should_exit_afk returns false when afk is not active"
 }
 
+# ============================================================================
+# Injection hardening: composer guard, type-once submit, strip marker, dedupe
+# ============================================================================
+
+test_strip_injection_marker() {
+  local stripped
+  stripped=$(strip_injection_marker "${FM_INJECT_MARK}Supervisor escalate: done")
+  [ "$stripped" = "Supervisor escalate: done" ] \
+    || fail "marker not stripped: '$stripped'"
+  # No marker → unchanged.
+  stripped=$(strip_injection_marker "no marker here")
+  [ "$stripped" = "no marker here" ] \
+    || fail "non-marker text changed: '$stripped'"
+  # Empty → empty.
+  stripped=$(strip_injection_marker "")
+  [ "$stripped" = "" ] || fail "empty text changed: '$stripped'"
+  # Only marker → empty.
+  stripped=$(strip_injection_marker "$FM_INJECT_MARK")
+  [ "$stripped" = "" ] || fail "bare marker not stripped: '$stripped'"
+  pass "strip_injection_marker removes the sentinel marker cleanly"
+}
+
+test_pane_input_pending_detects_partial_input() {
+  local dir state fakebin capture
+  dir=$(make_supercase pending-input)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  capture="$dir/pane.txt"
+  # Line 3 (cursor_y=2) has human's partial text (no Enter) → pending.
+  printf 'line one\nline two\nhuman draft text\n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=2 \
+    pane_input_pending "fakepane" \
+    || fail "pane_input_pending should detect non-empty composer (human text)"
+  pass "pane_input_pending detects partial input on the cursor line"
+}
+
+test_pane_input_pending_blank_is_not_pending() {
+  local dir state fakebin capture
+  dir=$(make_supercase pending-blank)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  capture="$dir/pane.txt"
+  # Cursor line (line 3, cursor_y=2) is blank → not pending.
+  printf 'some output\nmore output\n\n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=2 \
+    pane_input_pending "fakepane" \
+    && fail "blank composer line falsely detected as pending"
+  pass "pane_input_pending: blank cursor line is not pending"
+}
+
+test_pane_input_pending_idle_prompt_not_pending() {
+  local dir state fakebin capture
+  dir=$(make_supercase pending-prompt)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  capture="$dir/pane.txt"
+  # Cursor line (line 3, cursor_y=2) is a bare prompt ($) → idle → not pending.
+  printf 'output\noutput\n$ \n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=2 \
+    pane_input_pending "fakepane" \
+    && fail "bare prompt falsely detected as pending"
+  # Bare > prompt also idle.
+  printf 'output\noutput\n> \n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=2 \
+    pane_input_pending "fakepane" \
+    && fail "bare > prompt falsely detected as pending"
+  pass "pane_input_pending: bare prompts are not pending (idle)"
+}
+
+test_composer_guard_defers_on_partial_input() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase composer-guard)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"
+  # Cursor line has partial text (human mid-typing, no Enter).
+  printf 'human draft text\n' > "$capture"
+  escalate_add "$state" "done: PR 1"
+  afk_enter "$state"
+  if PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state"; then
+    fail "escalate_flush should defer when composer has pending input"
+  fi
+  [ -s "$sent" ] && fail "daemon injected into a pane with pending input"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer not preserved when deferred"
+  pass "composer guard defers injection when pane has pending input"
+}
+
+test_inject_types_once_retries_enter_only() {
+  # Scenario: Enter is swallowed on the first attempt. The daemon must retry
+  # Enter (NOT retype the digest) and succeed on the second Enter. Assert
+  # exactly ONE digest was typed (no concatenation), and the digest was
+  # eventually submitted.
+  local dir state fakebin sent capture swallow_file
+  dir=$(make_supercase swallow-enter)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  swallow_file="$dir/.swallow"
+  touch "$swallow_file"
+  escalate_add "$state" "done: PR 1"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_SWALLOW_FILE="$swallow_file" \
+    FM_INJECT_CONFIRM_SLEEP=0.1 FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed despite Enter retry"
+  # Exactly ONE digest line typed (send-keys -l called once). No retype.
+  local digest_lines
+  digest_lines=$(grep -cv '\[ENTER\]' "$sent")
+  [ "$digest_lines" -eq 1 ] \
+    || fail "expected 1 digest type, got $digest_lines (retype into uncleared composer?)"
+  # Two Enters: first swallowed, second submitted.
+  local enters
+  enters=$(grep -c '\[ENTER\]' "$sent")
+  [ "$enters" -eq 1 ] \
+    || fail "expected 1 recorded Enter (second after swallow), got $enters"
+  # Buffer cleared → success.
+  [ -s "$state/.subsuper-escalations" ] && fail "buffer not cleared after successful inject"
+  pass "swallowed Enter: type-once + Enter-retry, no concatenation"
+}
+
+test_inject_no_duplicate_on_success() {
+  # Scenario: normal inject (Enter works first time). Exactly ONE digest typed,
+  # ONE Enter, buffer cleared.
+  local dir state fakebin sent capture
+  dir=$(make_supercase normal-inject)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  escalate_add "$state" "done: PR 1"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_INJECT_CONFIRM_SLEEP=0.1 \
+    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed"
+  local digest_lines enters
+  digest_lines=$(grep -cv '\[ENTER\]' "$sent")
+  [ "$digest_lines" -eq 1 ] || fail "expected 1 digest, got $digest_lines (duplicate?)"
+  enters=$(grep -c '\[ENTER\]' "$sent")
+  [ "$enters" -eq 1 ] || fail "expected 1 Enter, got $enters"
+  [ -s "$state/.subsuper-escalations" ] && fail "buffer not cleared"
+  pass "normal inject: exactly one digest, one Enter, no duplicates"
+}
+
+test_classify_signal_dedup_against_scan() {
+  # If the catch-all scan already escalated a status (seen marker matches),
+  # classify_signal must self-handle to avoid a duplicate in the digest.
+  local dir state key out
+  dir=$(make_supercase signal-dedup)
+  state="$dir/state"
+  printf 'done: PR https://x/y/pull/9\n' > "$state/dup-s9.status"
+  # Simulate the catch-all scan having already escalated this status.
+  key=$(printf '%s' "dup-s9" | tr ':/.' '___')
+  printf 'done: PR https://x/y/pull/9' > "$state/.subsuper-seen-status-$key"
+  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/dup-s9.status" "$state")
+  case "$out" in self\|*) ;; *) fail "signal not deduped against scan: $out" ;; esac
+  # Without the seen marker, it should escalate.
+  rm -f "$state/.subsuper-seen-status-$key"
+  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/dup-s9.status" "$state")
+  case "$out" in escalate\|*) ;; *) fail "signal should escalate when not seen: $out" ;; esac
+  pass "classify_signal dedupes against the catch-all scan seen marker"
+}
+
+test_classify_stale_dedup_against_signal() {
+  # If the signal path already escalated a status (seen marker matches),
+  # classify_stale must self-handle to avoid a duplicate in the digest.
+  local dir state key out
+  dir=$(make_supercase stale-dedup)
+  state="$dir/state"
+  printf 'done: PR https://x/y/pull/10\n' > "$state/dup-s10.status"
+  key=$(printf '%s' "dup-s10" | tr ':/.' '___')
+  printf 'done: PR https://x/y/pull/10' > "$state/.subsuper-seen-status-$key"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-dup-s10" "$state")
+  case "$out" in self\|*) ;; *) fail "stale not deduped against signal: $out" ;; esac
+  # Without the seen marker, it should escalate.
+  rm -f "$state/.subsuper-seen-status-$key"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-dup-s10" "$state")
+  case "$out" in escalate\|*) ;; *) fail "stale should escalate when not seen: $out" ;; esac
+  pass "classify_stale dedupes against the signal path seen marker"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -778,3 +980,13 @@ test_busy_guard_defers_when_supervisor_busy
 test_marker_detection
 test_afk_turn_exemption
 test_should_exit_afk_when_afk_inactive
+# Injection hardening: composer guard, type-once submit, strip marker, dedupe.
+test_strip_injection_marker
+test_pane_input_pending_detects_partial_input
+test_pane_input_pending_blank_is_not_pending
+test_pane_input_pending_idle_prompt_not_pending
+test_composer_guard_defers_on_partial_input
+test_inject_types_once_retries_enter_only
+test_inject_no_duplicate_on_success
+test_classify_signal_dedup_against_scan
+test_classify_stale_dedup_against_signal

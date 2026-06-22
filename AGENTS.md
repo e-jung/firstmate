@@ -480,13 +480,16 @@ The marker travels with the message text; it does not rely on harness-level type
 The single-line format and the marker solve the same problem as the busy-guard (the daemon and the captain share one input channel): the digest is one unambiguous submission regardless of TUI, and firstmate can tell it apart from a real message.
 This is why fewer, cheaper firstmate turns handle the same fleet.
 
-**Injection hardening (the four fixes):**
+**Injection hardening (the fixes):**
 - **Single-line digest** — embedded newlines are collapsed to a literal separator before injection, so submission is unambiguous regardless of harness.
-- **Busy-guard on the supervisor pane** — before injecting, the daemon checks `pane_is_busy` on firstmate's own pane and **defers** (leaves the escalation buffered) if it is in use. In afk mode this is belt-and-suspenders (no human is typing), but it protects against firstmate being mid-turn.
-- **Turn-started confirmation** — after `send-keys` + Enter, the daemon verifies the pane content changed; a swallowed Enter triggers a bounded retry so an escalation is never lost silently.
-- **Auto-discovered supervisor pane** — the daemon resolves its injection target from `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE` (inherited from the pane that launched it), then a `firstmate:0` fallback with a warning.
+- **Composer guard on the supervisor pane** — before injecting, the daemon checks both `pane_is_busy` (harness busy footer = agent mid-turn) and `pane_input_pending` (non-empty cursor line = human mid-typing or previous injection with swallowed Enter). Either condition **defers** the injection (buffer preserved for retry). This is the human-in-the-pane safety property: the daemon never merges its digest into the captain's half-typed line.
+- **Type-once submit model** — the digest is typed once via `send-keys -l`, then submitted with Enter. If the composer still has text after Enter (swallowed Enter), the daemon retries Enter only (never retypes the digest), preventing concatenation of two sentinel-prefixed digests into one corrupted turn.
+- **Marker strip** — `strip_injection_marker` removes the sentinel prefix before classification/relay, so the digest text firstmate sees is clean.
+- **Portable singleton lock** — the daemon uses the repo's mkdir-based lock helper (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS.
+- **Dedupe across signal/stale/scan** — `classify_signal` and `classify_stale` both check the seen-status marker before escalating, so a status escalated by one path is not re-escalated by another in the same digest.
+- **Auto-discovered supervisor pane** — the daemon resolves its injection target from `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE` (inherited from the pane that launched it), then a `firstmate:0` fallback with a warning; the resolution source is logged at startup so a wrong-but-resolving fallback is detectable.
 
-**Reliability properties (must hold):** nothing is lost (the #29 queue plus `fm-wake-drain.sh` recover any missed/crashed injection); wedge detection is bounded-latency, not lossy; the catch-all scan backs up the keyword classifier; the daemon preserves single-instance `flock`, crash-loop backoff, a pane-gone guard, and a signal-trapped shutdown that flushes buffered escalations before exit.
+**Reliability properties (must hold):** nothing is lost (the #29 queue plus `fm-wake-drain.sh` recover any missed/crashed injection); wedge detection is bounded-latency, not lossy; the catch-all scan backs up the keyword classifier; the daemon preserves single-instance portable lock, crash-loop backoff, a pane-gone guard, and a signal-trapped shutdown that flushes buffered escalations before exit.
 `FM_INJECT_SKIP` (default `heartbeat`) force-self-handles matching kinds, overriding classification - use sparingly.
 
 ### Stuck-crewmate playbook (escalate in order)
