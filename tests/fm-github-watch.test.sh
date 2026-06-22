@@ -53,6 +53,7 @@ case "$sub" in
     for a in "$@"; do
       case "$a" in repos/*) path=$a ;; esac
     done
+    path="${path%%\?*}"   # strip any ?per_page=... query before matching
     # repos/OWNER/REPO/issues/NUM/comments  -> comments-OWNER-REPO-NUM
     # repos/OWNER/REPO/pulls/NUM/reviews    -> reviews-OWNER-REPO-NUM
     # repos/OWNER/REPO/commits/SHA/check-runs -> ci-SHA
@@ -194,10 +195,10 @@ test_comment_detection_advances_seen_after_print() {
   run_poll "$dir" >/dev/null
   grep -Fxq "comments=5" "$sf" || fail "baseline comments not set"
 
-  # Cycle 2: two new maintainer comments.
+  # Cycle 2: two new comments.
   printf '7\n' > "$dir/fixture/comments-kunchenguid-firstmate-30"
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new maintainer comment(s)" \
+  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new comment(s)" \
     || fail "comment increase did not emit event; got: $out"
   # Seen marker advanced to the new high-water (after the print).
   grep -Fxq "comments=7" "$sf" || fail "seen marker not advanced after event"
@@ -229,14 +230,14 @@ test_losslessness_redetects_when_seen_write_fails() {
   chmod a-w "$dir/state/.github-watch-seen"
   out=$(run_poll "$dir")
   chmod u+w "$dir/state/.github-watch-seen"
-  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new maintainer comment(s)" \
+  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new comment(s)" \
     || fail "event did not print when seen write failed; got: $out"
   # Marker must NOT have advanced (the whole point).
   grep -Fxq "comments=5" "$sf" || fail "seen marker advanced despite failing write (permanent swallow)"
 
   # Next cycle (writable again) re-detects the same event: lossless.
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new maintainer comment(s)" \
+  printf '%s\n' "$out" | grep -Fq "COMMENT: kunchenguid/firstmate#30 has 2 new comment(s)" \
     || fail "event was not re-detected after failed seen write; got: $out"
 
   pass "failed seen write leaves the event re-detectable (lossless)"

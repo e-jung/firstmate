@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # fm-github-watch.sh — GitHub events watcher for the fleet's open PRs.
 #
-# Discovers all of a contributor's open PRs and surfaces new maintainer
-# comments, CI status changes, reviews, and merge/close transitions as
-# one-line events on stdout. Built to run as a watcher check script: it
-# prints iff firstmate should wake, and stays silent otherwise.
+# Discovers all of a contributor's open PRs and surfaces new comments (from
+# maintainers, reviewers, or bots), CI status changes, reviews, and
+# merge/close transitions as one-line events on stdout. Built to run as a
+# watcher check script: it prints iff firstmate should wake, and stays
+# silent otherwise.
 #
 # Wire it in with a check script the existing watcher already sweeps, e.g.:
 #   ln -s ../bin/fm-github-watch.sh state/github-events.check.sh
@@ -171,7 +172,7 @@ discover_prs() {
 
 # count_comments <owner> <repo> <pr> <contributor>
 count_comments() {
-  CONTRIB_WATCH="$4" ghc api "repos/$1/$2/issues/$3/comments" \
+  CONTRIB_WATCH="$4" ghc api "repos/$1/$2/issues/$3/comments?per_page=100" \
     --jq '[.[] | select(.user.login != env.CONTRIB_WATCH)] | length'
 }
 
@@ -179,7 +180,7 @@ count_comments() {
 # Excludes the contributor's own reviews (self-reviews) but keeps maintainer and
 # bot reviews (Greptile, coderabbit, etc. have distinct logins).
 count_reviews() {
-  CONTRIB_WATCH="$4" ghc api "repos/$1/$2/pulls/$3/reviews" \
+  CONTRIB_WATCH="$4" ghc api "repos/$1/$2/pulls/$3/reviews?per_page=100" \
     --jq '[.[] | select(.user.login != env.CONTRIB_WATCH)] | length'
 }
 
@@ -196,7 +197,7 @@ head_sha() {
 # ci_signature <owner> <repo> <sha> -> sorted multiset of check conclusions/statuses
 ci_signature() {
   [ -n "$3" ] || return 0
-  ghc api "repos/$1/$2/commits/$3/check-runs" \
+  ghc api "repos/$1/$2/commits/$3/check-runs?per_page=100" \
     --jq '[.check_runs[] | (.conclusion // .status)] | sort | join(",")'
 }
 
@@ -280,7 +281,7 @@ process_pr() {
 
     # comments (high-water): event on increase only.
     if is_int "$c_count" && is_int "$seen_c" && [ "$c_count" -gt "$seen_c" ]; then
-      ev="${ev}COMMENT: ${owner}/${repo}#${pr} has $((c_count - seen_c)) new maintainer comment(s)
+      ev="${ev}COMMENT: ${owner}/${repo}#${pr} has $((c_count - seen_c)) new comment(s)
 "
     fi
     # reviews (high-water): event on increase only.
