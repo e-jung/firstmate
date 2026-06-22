@@ -81,8 +81,10 @@ META
 test_spawn_contract_and_mkdir_pattern() {
   # Structural: fm-spawn must create the gotmp dir, record tasktmp in meta, and export
   # GOTMPDIR into the pane. Assert the contract lines are present in the source.
+  # shellcheck disable=SC2016  # single quotes are deliberate: these are literal source strings
   grep -F 'mkdir -p "$TASK_TMP/gotmp"' "$SPAWN" >/dev/null \
     || fail "fm-spawn missing: mkdir of gotmp under TASK_TMP"
+  # shellcheck disable=SC2016  # single quotes are deliberate: literal source string
   grep -F 'echo "tasktmp=$TASK_TMP"' "$SPAWN" >/dev/null \
     || fail "fm-spawn missing: tasktmp= line in meta write"
   grep -F 'export GOTMPDIR=' "$SPAWN" >/dev/null \
