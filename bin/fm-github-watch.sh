@@ -237,10 +237,11 @@ atomic_write() {
 # check-runs have not populated yet) so a later status change still fires.
 build_seen() {
   local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_sig=$7 sha=$8 p_state=$9
-  local seen_c seen_r seen_ci new_c new_r ci_val block
+  local seen_c seen_r seen_ci seen_state new_c new_r ci_val state_val block
   seen_c=$(seen_get "$sf" comments)
   seen_r=$(seen_get "$sf" reviews)
   seen_ci=$(seen_get "$sf" ci)
+  seen_state=$(seen_get "$sf" state)
   new_c=$seen_c; new_r=$seen_r
   if is_int "$c_count"; then
     if is_int "$seen_c"; then new_c=$((seen_c > c_count ? seen_c : c_count)); else new_c=$c_count; fi
@@ -250,12 +251,14 @@ build_seen() {
   fi
   ci_val=$ci_sig
   [ -n "$ci_val" ] || ci_val=$seen_ci
+  state_val=$p_state
+  [ -n "$state_val" ] || state_val=$seen_state
   block=$(printf 'owner=%s\nrepo=%s\npr=%s\ninitialized=1' "$owner" "$repo" "$pr")
-  is_int "$new_c"    && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
-  is_int "$new_r"    && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
-  [ -n "$ci_val" ]   && block=$(printf '%s\nci=%s'       "$block" "$ci_val")
-  [ -n "$sha" ]      && block=$(printf '%s\nsha=%s'      "$block" "$sha")
-  [ -n "$p_state" ]  && block=$(printf '%s\nstate=%s'    "$block" "$p_state")
+  is_int "$new_c"     && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
+  is_int "$new_r"     && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
+  [ -n "$ci_val" ]    && block=$(printf '%s\nci=%s'       "$block" "$ci_val")
+  [ -n "$sha" ]       && block=$(printf '%s\nsha=%s'      "$block" "$sha")
+  [ -n "$state_val" ] && block=$(printf '%s\nstate=%s'    "$block" "$state_val")
   printf '%s' "$block"
 }
 
@@ -372,6 +375,7 @@ detect_left_open() {
     pr=$(seen_get "$f" pr)
     [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$pr" ] || continue
     p_state=$(pr_state "$owner" "$repo" "$pr")
+    [ -n "$p_state" ] || continue   # transient gh failure: leave seen state untouched
     [ "$p_state" = "$seen_state" ] && continue   # unchanged: no event, no rewrite
     case "$p_state" in
       MERGED|CLOSED)
