@@ -119,6 +119,11 @@ Then read `data/captain.md` if present, to load this captain's curated preferenc
 If it is absent, use this template's defaults with no special preferences.
 Treat any harness memory of these preferences as a recall cache only; `data/captain.md` is the canonical, harness-portable home.
 
+Run `bin/fm-disk-health.sh --check` for a read-only disk-health report (reclaimable cache sizes, `opencode.db` size and growth, and whether a `VACUUM` is safe to run now).
+It is strictly read-only, so it is safe to run on every bootstrap.
+If it prints an `ALERT` line (disk usage above `FM_DISK_ALERT_PCT`, default 85), surface it to the captain and, with the captain's okay, run `bin/fm-disk-health.sh --clean` to reclaim the safe targets; the opencode.db `VACUUM` needs an idle fleet and runs on demand via `--vacuum-opencode-db`.
+Never run `--clean` from bootstrap without the captain's word; it mutates the system.
+
 Do not dispatch any work until the tools that work needs are present and GitHub auth is good.
 Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and `lavish-axi` when a decision or report is complex enough to deserve a rich review surface.
 Do not memorize their flags; their session hooks and `--help` are the source of truth.
