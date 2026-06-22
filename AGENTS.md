@@ -103,6 +103,8 @@ state/               volatile runtime signals; gitignored
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); fm-guard.sh reads it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
+  .github-watch-config  fm-github-watch.sh filter/contributor config (key=value); never touch unless driving that tool
+  .github-watch-seen/   fm-github-watch.sh per-PR seen state (high-water marks); owned by that script
 .no-mistakes/        local validation state and evidence; gitignored
 ```
 

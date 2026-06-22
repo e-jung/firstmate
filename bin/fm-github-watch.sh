@@ -46,7 +46,6 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 STATE="${FM_STATE_OVERRIDE:-$FM_ROOT/state}"
 CONFIG="$STATE/.github-watch-config"
 SEEN_DIR="$STATE/.github-watch-seen"
-DEFAULT_CONTRIBUTOR="${FM_GH_CONTRIBUTOR:-e-jung}"
 ALL_FILTERS="comments,ci,reviews,merge"
 DEFAULT_POLL_SECS="${FM_GH_POLL_SECS:-300}"
 
@@ -71,6 +70,13 @@ cfg_read() {
   awk -F= -v k="$key" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$CONFIG"
 }
 
+# cfg_has <key> -> 0 if the key exists in the config (distinguishes a configured
+# empty value, e.g. `filters=`, from a missing key so "all filters off" sticks).
+cfg_has() {
+  local key=$1
+  [ -f "$CONFIG" ] && grep -q "^${key}=" "$CONFIG"
+}
+
 # cfg_write <key> <value> (upsert a single key=value line)
 cfg_write() {
   local key=$1 val=$2 tmp
@@ -85,16 +91,23 @@ cfg_write() {
 }
 
 get_contributor() {
+  # Precedence: configured value > FM_GH_CONTRIBUTOR env > authenticated gh user.
+  # No hardcoded default: a shared tool should poll whoever is logged in.
   local v
   v=$(cfg_read contributor)
-  printf '%s' "${v:-$DEFAULT_CONTRIBUTOR}"
+  if [ -n "$v" ]; then printf '%s' "$v"; return; fi
+  if [ -n "${FM_GH_CONTRIBUTOR:-}" ]; then printf '%s' "$FM_GH_CONTRIBUTOR"; return; fi
+  ghc api user -q .login 2>/dev/null | tr -d '\n'
 }
 
 get_filters() {
-  local v
-  v=$(cfg_read filters)
-  [ -n "$v" ] || v=$ALL_FILTERS
-  printf '%s' "$v"
+  # A configured value (even empty = all filters off) is respected; only a
+  # never-configured key falls back to the full default set.
+  if cfg_has filters; then
+    cfg_read filters
+  else
+    printf '%s' "$ALL_FILTERS"
+  fi
 }
 
 filter_enabled() {
@@ -162,9 +175,12 @@ count_comments() {
     --jq '[.[] | select(.user.login != env.CONTRIB_WATCH)] | length'
 }
 
-# count_reviews <owner> <repo> <pr>
+# count_reviews <owner> <repo> <pr> <contributor>
+# Excludes the contributor's own reviews (self-reviews) but keeps maintainer and
+# bot reviews (Greptile, coderabbit, etc. have distinct logins).
 count_reviews() {
-  ghc api "repos/$1/$2/pulls/$3/reviews" --jq 'length'
+  CONTRIB_WATCH="$4" ghc api "repos/$1/$2/pulls/$3/reviews" \
+    --jq '[.[] | select(.user.login != env.CONTRIB_WATCH)] | length'
 }
 
 # pr_state <owner> <repo> <pr> -> OPEN|MERGED|CLOSED (empty on failure)
@@ -248,7 +264,7 @@ process_pr() {
 
   c_count="" r_count="" p_state="" sha="" ci_sig=""
   filter_enabled comments && c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor")
-  filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr")
+  filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr" "$contributor")
   filter_enabled merge    && p_state=$(pr_state "$owner" "$repo" "$pr")
   if filter_enabled ci; then
     sha=$(head_sha "$owner" "$repo" "$pr")
