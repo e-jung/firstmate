@@ -146,6 +146,7 @@ Agent-only reference skills live under `.agents/skills/` and are loaded by first
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
 - [`AGENTS.md`](AGENTS.md) - firstmate's full operating manual for the orchestrator agent.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - how to contribute, including the dev/test commands.
+>>>>>>> a7c1fd1 (no-mistakes(document): docs(ghwatch): document FM_GH_CLOSE_REPROBE_SECS config knob)
 
 ## Contributing
 
