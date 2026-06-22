@@ -165,6 +165,10 @@ list_remove() {
 discover_prs() {
   local contributor
   contributor=$(get_contributor)
+  # An empty contributor (gh missing/unauthed) must NOT pass --author="" to the
+  # search: GitHub treats an empty author qualifier as no filter, which would
+  # match open PRs across every repo and flood the seen state.
+  [ -n "$contributor" ] || return 0
   ghc search prs --author="$contributor" --state=open \
     --json repository,number \
     --jq '.[] | [.repository.nameWithOwner, .number] | @tsv'
@@ -206,9 +210,14 @@ ci_signature() {
 # atomic_write <file> <content> — write seen state via temp + rename so a crash
 # or a read-only state dir can never leave a partial file. On any failure the
 # prior file is left untouched, so the event re-fires next cycle (lossless).
+# The temp lives in a hidden .tmp subdir of the seen dir (same filesystem, so
+# the rename is atomic) so a crash-leaked temp never matches detect_left_open's
+# `"$SEEN_DIR"/*` glob and cause a double-fire.
 atomic_write() {
-  local file=$1 content=$2 tmp
-  tmp="$file.tmp.$$"
+  local file=$1 content=$2 tmp stagedir
+  stagedir="$SEEN_DIR/.tmp"
+  tmp="$stagedir/$(basename "$file").$$"
+  mkdir -p "$stagedir" 2>/dev/null || true
   # Redirect fd 2 to /dev/null BEFORE the output redirect so a failure to open
   # the temp (read-only dir) is reported to /dev/null, not the terminal.
   if printf '%s\n' "$content" 2>/dev/null > "$tmp"; then
