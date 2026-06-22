@@ -302,6 +302,32 @@ test_closed_then_merged_is_not_swallowed() {
   pass "CLOSED is treated as non-terminal: close->merge still emits MERGED"
 }
 
+test_closed_pr_reprobe_window_is_bounded() {
+  # A closed PR is re-probed only within CLOSE_REPROBE_SECS of closing, so
+  # accumulated closed PRs cannot push the fleet past the rate limit. With a
+  # zero window the PR is settled immediately: a later merge is intentionally
+  # not re-detected (the cost-bound tradeoff). The default window is generous.
+  local dir out sf
+  dir=$(make_case close-window)
+  seed_prs "$dir" $'kunchenguid/firstmate\t42'
+  printf 'OPEN\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  sf="$dir/state/.github-watch-seen/kunchenguid-firstmate-42"
+  run_poll "$dir" >/dev/null                       # baseline OPEN
+  : > "$dir/fixture/prs"
+  printf 'CLOSED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(run_poll "$dir")                           # emits CLOSED, stamps closed_at
+  printf '%s\n' "$out" | grep -Fq "CLOSED: kunchenguid/firstmate#42" || fail "close not emitted"
+  grep -Fq "closed_at=" "$sf" || fail "closed_at not stamped on close"
+
+  # Zero window: the aged-out CLOSED PR is not re-probed, so a merge is missed.
+  printf 'MERGED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(PATH="$dir/fakebin:$PATH" GH_FIXTURE="$dir/fixture" FM_GH_CONTRIBUTOR=e-jung \
+        FM_GH_CLOSE_REPROBE_SECS=0 FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" --once)
+  printf '%s\n' "$out" | grep -Fq "MERGED" \
+    && fail "aged-out CLOSED PR was re-probed (cost not bounded)" || true
+  pass "closed PR past the re-probe window stops consuming an API call"
+}
+
 test_config_roundtrip() {
   local dir
   dir=$(make_case config)
@@ -445,6 +471,7 @@ test_comment_detection_advances_seen_after_print
 test_losslessness_redetects_when_seen_write_fails
 test_merge_detection_on_left_open
 test_closed_then_merged_is_not_swallowed
+test_closed_pr_reprobe_window_is_bounded
 test_config_roundtrip
 test_review_detection
 test_ci_detection
