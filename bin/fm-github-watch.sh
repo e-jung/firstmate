@@ -33,6 +33,8 @@
 # The ci filter reads the Checks API (check-runs); CI providers that report
 # only via the legacy commit status API (some older Travis/Coveralls setups)
 # are not covered. Use `gh pr checks` directly for a unified view.
+# Comment, review, and check-run counts fetch up to 100 items per type per PR
+# (per_page=100, no pagination); a single PR with >100 of one kind would cap.
 #
 # Losslessness: for each PR, events are emitted BEFORE its seen marker advances
 # (and bash's builtin printf write()s to the capture pipe immediately, so an
@@ -169,7 +171,7 @@ discover_prs() {
   # search: GitHub treats an empty author qualifier as no filter, which would
   # match open PRs across every repo and flood the seen state.
   [ -n "$contributor" ] || return 0
-  ghc search prs --author="$contributor" --state=open \
+  ghc search prs --author="$contributor" --state=open --limit 1000 \
     --json repository,number \
     --jq '.[] | [.repository.nameWithOwner, .number] | @tsv'
 }
