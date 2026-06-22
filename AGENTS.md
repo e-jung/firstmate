@@ -119,6 +119,8 @@ Then read `data/captain.md` if present, to load this captain's curated preferenc
 If it is absent, use this template's defaults with no special preferences.
 Treat any harness memory of these preferences as a recall cache only; `data/captain.md` is the canonical, harness-portable home.
 
+Seed the harness-native todo/task list from the backlog: run `bin/fm-todos.sh` and translate each row into the harness's todo tool (opencode: `todowrite`; claude: `TodoWrite`; if the harness has no such tool, skip silently). This is mandatory, not optional - the sidebar must mirror fleet state from the first turn, with no improvisation: the script's output is the source of truth and the tool call only carries it.
+
 Run `bin/fm-disk-health.sh --check` for a read-only disk-health report (reclaimable cache sizes, `opencode.db` size and growth, and whether a `VACUUM` is safe to run now).
 It is strictly read-only, so it is safe to run on every bootstrap.
 If it prints an `ALERT` line (disk usage above `FM_DISK_ALERT_PCT`, default 85), surface it to the captain and, with the captain's okay, run `bin/fm-disk-health.sh --clean` to reclaim the safe targets; the opencode.db `VACUUM` needs an idle fleet and runs on demand via `--vacuum-opencode-db`.
@@ -372,6 +374,7 @@ For `kind=secondmate`, the script creates the same kind of window but starts dir
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
 After spawning, peek the pane to confirm the crewmate is processing the brief (and handle any trust dialog per section 4).
 Add the task to `data/backlog.md` under In flight.
+Then re-run `bin/fm-todos.sh` and refresh the todo list so the new item appears in the sidebar.
 
 ### Supervise
 
@@ -427,6 +430,7 @@ The script refuses if the worktree holds unpushed work; treat a refusal as a sto
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 After a successful PR-based teardown, it also runs `bin/fm-fleet-sync.sh` for that project, best-effort, so the clone's local default catches up to the merge and the just-merged branch, now gone on the remote and free of its worktree, is pruned immediately.
 Then move the task to Done in `data/backlog.md` (with the full `https://...` PR URL or local merge note and date), keep Done to the 10 most recent, re-evaluate the queue, and dispatch anything that was blocked on this task or is now time/date-due.
+Re-run `bin/fm-todos.sh` and refresh the todo list whenever the backlog changes - dispatch, teardown, or any decision that moves or unblocks a queued item - so the sidebar stays a live reflection of fleet state.
 
 ### Secondmate teardown (explicit only)
 
@@ -444,7 +448,7 @@ A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold th
 - There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
 - Relay the findings to the captain: plain chat for a focused answer, lavish-axi when the report has structure worth a visual (multiple findings, options, a plan).
 - Tear down immediately - no merge gate. `bin/fm-teardown.sh` allows a scout worktree's scratch commits and dirty files once the report exists; if the report is missing, it refuses, because the findings are the work product.
-- Record it in Done with the report path instead of a PR link, keep Done to the 10 most recent, then re-evaluate the queue and dispatch anything unblocked or now time/date-due.
+- Record it in Done with the report path instead of a PR link, keep Done to the 10 most recent, then re-evaluate the queue and dispatch anything unblocked or now time/date-due, and re-run `bin/fm-todos.sh` to refresh the sidebar.
 
 **Promotion.** When a scout's findings reveal shippable work (a reproduced bug with a clear fix) and the captain wants it shipped, promote the task in place instead of respawning: run `bin/fm-promote.sh <id>` (flips `kind=` to ship in meta, restoring teardown's full protection), then send the crewmate its ship instructions - inventory scratch state, reset to a clean default-branch base, carry over only intended fix changes, create branch `fm/<id>`, implement, and report `done` according to the project's delivery mode.
 The crewmate keeps its worktree, loaded context, and repro, but the ship branch must start from a clean base with only intended changes; scratch commits and debug edits from the scout phase never ride along.
