@@ -268,7 +268,7 @@ test_merge_detection_on_left_open() {
 
   # A later cycle does not re-report the merge (state no longer OPEN).
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "MERGED" && fail "merge event re-reported after settling" || true
+  if printf '%s\n' "$out" | grep -Fq "MERGED"; then fail "merge event re-reported after settling"; fi
 
   pass "PR leaving the open set as merged emits MERGED once"
 }
@@ -290,7 +290,7 @@ test_closed_then_merged_is_not_swallowed() {
 
   # Steady closed: must NOT re-emit CLOSED every cycle.
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "CLOSED" && fail "CLOSED re-emitted while settled" || true
+  if printf '%s\n' "$out" | grep -Fq "CLOSED"; then fail "CLOSED re-emitted while settled"; fi
 
   # Closed -> reopened -> merged all between polls: MERGED must still fire
   # (CLOSED is not terminal; the watcher re-probes it).
@@ -323,8 +323,9 @@ test_closed_pr_reprobe_window_is_bounded() {
   printf 'MERGED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
   out=$(PATH="$dir/fakebin:$PATH" GH_FIXTURE="$dir/fixture" FM_GH_CONTRIBUTOR=e-jung \
         FM_GH_CLOSE_REPROBE_SECS=0 FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" --once)
-  printf '%s\n' "$out" | grep -Fq "MERGED" \
-    && fail "aged-out CLOSED PR was re-probed (cost not bounded)" || true
+  if printf '%s\n' "$out" | grep -Fq "MERGED"; then
+    fail "aged-out CLOSED PR was re-probed (cost not bounded)"
+  fi
   pass "closed PR past the re-probe window stops consuming an API call"
 }
 
