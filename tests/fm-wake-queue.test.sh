@@ -86,7 +86,12 @@ case "${1:-}" in
   send-keys)
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        -l) shift; [ "$#" -gt 0 ] && printf '%s\n' "$1" >> "${FM_FAKE_TMUX_SENT:-/dev/null}" ;;
+        -l) shift; [ "$#" -gt 0 ] && {
+          printf '%s\n' "$1" >> "${FM_FAKE_TMUX_SENT:-/dev/null}"
+          # Reflect sent text into capture so inject_msg's turn-started
+          # confirmation (before != after) sees a content change.
+          [ -n "${FM_FAKE_TMUX_CAPTURE:-}" ] && printf '%s\n' "$1" >> "$FM_FAKE_TMUX_CAPTURE"
+        } ;;
         Enter) printf '[ENTER]\n' >> "${FM_FAKE_TMUX_SENT:-/dev/null}" ;;
       esac
       shift
@@ -466,15 +471,18 @@ test_housekeeping_resumed_stale_cleared() {
 }
 
 test_escalate_batches_into_one_digest() {
-  local dir state fakebin sent n
+  local dir state fakebin sent capture n
   dir=$(make_supercase batch)
   state="$dir/state"
   fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
+  afk_enter "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" || fail "escalate_flush failed"
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed"
   grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
   grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
   grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
@@ -487,16 +495,19 @@ test_escalate_batches_into_one_digest() {
 }
 
 test_escalate_batch_age_uses_first_append() {
-  local dir state fakebin sent
+  local dir state fakebin sent capture
   dir=$(make_supercase batch-age)
   state="$dir/state"
   fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   echo $(( $(date +%s) - 100 )) > "$state/.subsuper-escalations.since"
+  afk_enter "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 housekeeping "$state"
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 \
+    housekeeping "$state"
   grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
     || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
@@ -589,6 +600,148 @@ test_signal_escalate_marks_seen_no_catchall_refire() {
   pass "captain signal escalate marks seen so the catch-all scan does not re-fire"
 }
 
+# ============================================================================
+# /afk presence-gating + injection hardening
+# ============================================================================
+
+test_collapse_newlines_pure() {
+  local out
+  out=$(_collapse_newlines $'line one\nline two\nline three')
+  [ "$out" = "line one - line two - line three" ] || fail "collapse failed: '$out'"
+  out=$(_collapse_newlines "no newlines here")
+  [ "$out" = "no newlines here" ] || fail "collapse changed no-newline text"
+  out=$(_collapse_newlines $'a\nb')
+  [ "$out" = "a - b" ] || fail "collapse two lines failed: '$out'"
+  pass "_collapse_newlines replaces newlines with literal separator"
+}
+
+test_afk_absent_daemon_does_not_inject() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase afk-off)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  escalate_add "$state" "done: PR 1"
+  # afk flag deliberately NOT set
+  if PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state"; then
+    fail "escalate_flush succeeded while afk inactive"
+  fi
+  [ -s "$sent" ] && fail "daemon injected while afk inactive"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer not preserved when afk inactive"
+  pass "afk flag absent: daemon does not inject, buffer preserved"
+}
+
+test_afk_present_injects_with_marker() {
+  local dir state fakebin sent capture sent_line
+  dir=$(make_supercase afk-on)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  escalate_add "$state" "done: PR 1"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed with afk active"
+  [ -s "$sent" ] || fail "no injection sent with afk active"
+  sent_line=$(grep -v '\[ENTER\]' "$sent" | head -1)
+  message_is_injection "$sent_line" || fail "injection not prefixed with sentinel marker"
+  pass "afk flag present: daemon injects with sentinel marker prefix"
+}
+
+test_inject_digest_is_single_line() {
+  local dir state fakebin sent capture non_enter
+  dir=$(make_supercase single-line)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  escalate_add "$state" "done: PR https://x/y/pull/1"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed"
+  # The sent log is: <digest-line>\n[ENTER]\n. The digest must be exactly one
+  # line (no embedded newlines that would fragment submission).
+  non_enter=$(grep -cv '\[ENTER\]' "$sent")
+  [ "$non_enter" -eq 1 ] || fail "expected 1 digest line, got $non_enter (embedded newlines?)"
+  grep -v '\[ENTER\]' "$sent" | grep -qF 'done: PR https://x/y/pull/1' \
+    || fail "digest missing first event"
+  grep -v '\[ENTER\]' "$sent" | grep -qF 'needs-decision: pick A' \
+    || fail "digest missing second event"
+  pass "injected digest is single-line (no embedded newlines)"
+}
+
+test_busy_guard_defers_when_supervisor_busy() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase busy-guard)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"
+  # pane shows a busy signature (firstmate mid-turn)
+  printf 'esc to interrupt\n' > "$capture"
+  escalate_add "$state" "done: PR 1"
+  afk_enter "$state"
+  if PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state"; then
+    fail "escalate_flush should defer when supervisor pane busy"
+  fi
+  [ -s "$sent" ] && fail "daemon injected into a busy pane"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer not preserved when deferred"
+  pass "busy-guard defers injection when supervisor pane is busy"
+}
+
+test_marker_detection() {
+  # message_is_injection: marker present -> injection; absent -> real message
+  message_is_injection "${FM_INJECT_MARK}Supervisor escalate: done" \
+    || fail "marker-prefixed message not detected as injection"
+  message_is_injection "how's it going?" \
+    && fail "plain message misdetected as injection"
+  message_is_injection "" && fail "empty message misdetected as injection"
+  # should_exit_afk: the full afk-exit contract
+  local dir state
+  dir=$(make_supercase marker-detect)
+  state="$dir/state"
+  afk_enter "$state"
+  should_exit_afk "$state" "${FM_INJECT_MARK}escalate" \
+    && fail "marker message should not exit afk (internal escalation)"
+  should_exit_afk "$state" "status update please" \
+    || fail "plain message should exit afk (captain is back)"
+  pass "marker detection: marker -> stay afk, no marker -> exit afk"
+}
+
+test_afk_turn_exemption() {
+  local dir state
+  dir=$(make_supercase afk-exempt)
+  state="$dir/state"
+  afk_enter "$state"
+  # /afk while already away must NOT self-cancel (re-entering/extending)
+  should_exit_afk "$state" "/afk" \
+    && fail "bare /afk should not exit afk"
+  should_exit_afk "$state" "/afk back in an hour" \
+    && fail "/afk with args should not exit afk"
+  # a non-/afk skill invocation DOES exit (the captain is actively working)
+  should_exit_afk "$state" "/no-mistakes" \
+    || fail "non-afk skill should exit afk"
+  pass "/afk invocation is exempt from afk exit (no self-cancel)"
+}
+
+test_should_exit_afk_when_afk_inactive() {
+  local dir state
+  dir=$(make_supercase no-afk)
+  state="$dir/state"
+  # afk flag absent: should never signal exit (nothing to exit)
+  should_exit_afk "$state" "hello" \
+    && fail "should_exit_afk true when afk inactive"
+  should_exit_afk "$state" "${FM_INJECT_MARK}test" \
+    && fail "should_exit_afk true when afk inactive (marker)"
+  pass "should_exit_afk returns false when afk is not active"
+}
+
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor
@@ -616,3 +769,12 @@ test_inject_skip_forces_self
 test_is_wake_reason_distinguishes_status_stdout
 test_terminal_stale_escalate_leaves_no_marker
 test_signal_escalate_marks_seen_no_catchall_refire
+# /afk presence-gating + injection hardening.
+test_collapse_newlines_pure
+test_afk_absent_daemon_does_not_inject
+test_afk_present_injects_with_marker
+test_inject_digest_is_single_line
+test_busy_guard_defers_when_supervisor_busy
+test_marker_detection
+test_afk_turn_exemption
+test_should_exit_afk_when_afk_inactive

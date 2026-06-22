@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-supervise-daemon.sh — #29-aware sub-supervisor (closes #27's P2; P3 deferred).
+# fm-supervise-daemon.sh — presence-gated sub-supervisor (closes #27's P2).
 #
 # Wraps bin/fm-watch.sh: runs it as a child, classifies each wake reason, and
 # either SELF-HANDLES the routine majority in bash (no firstmate turn) or
@@ -10,8 +10,25 @@
 # check-output events reach the LLM, and even then as one pre-read digest per
 # batch window.
 #
-# Reliability model (see AGENTS.md §8 and the scout report
-# data/fm-supervision-tokens-s9/report.md):
+# PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
+# injects ONLY when the durable away-mode flag state/.afk is present. Invoking
+# the /afk skill sets that flag and starts this daemon; any real (unmarked)
+# user message clears it and firstmate resumes full per-wake responsiveness.
+# When afk is off, the daemon stays quiet — it self-handles routine wakes and
+# buffers escalations without injecting, so the base one-shot fm-watch.sh
+# protocol is the active mechanism. Escalations that arrive while afk is off
+# survive in state/.subsuper-escalations and are flushed on the next
+# "while you were out" catch-up or when afk is re-entered.
+#
+# IN-BAND SENTINEL MARKER. Every daemon injection is prefixed with
+# FM_INJECT_MARK (ASCII unit separator, 0x1f) — a byte a human would never type
+# at the start of a message. Firstmate's contract: a message that starts with
+# the marker is an internal escalation (stay afk); a message without it means
+# the captain is back (exit afk, flush catch-up, resume per-wake responsiveness).
+# The marker and the busy-guard solve the same problem — the daemon and the
+# human share one input channel — so they live together under /afk.
+#
+# Reliability model (see AGENTS.md §8):
 #   - Nothing is lost: the #29 watcher enqueues every wake to state/.wake-queue
 #     BEFORE advancing its suppression markers, so a crash/restart/missed
 #     injection is recovered on the next fm-wake-drain.sh. The daemon does not
@@ -32,8 +49,11 @@
 # signal-trapped shutdown that flushes buffered escalations before exit.
 #
 # Usage: fm-supervise-daemon.sh
-#          Long-lived background loop. Env knobs:
-#          FM_SUPERVISOR_TARGET     supervisor tmux target (default firstmate:0)
+#          Long-lived background loop. Normally started by the /afk skill, which
+#          sets state/.afk first. Env knobs:
+#          FM_SUPERVISOR_TARGET     supervisor tmux target (override; otherwise
+#                                   auto-discovered from TMUX_PANE, then
+#                                   firstmate:0 fallback)
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -48,6 +68,7 @@
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
 #                                   the watcher is mid-cycle (default 15)
 #          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
+#          FM_INJECT_CONFIRM_RETRIES send-keys verify retries (default 3)
 #          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
@@ -71,12 +92,24 @@ HOUSEKEEPING_TICK_DEFAULT=15
 BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.'
 CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
 INJECT_FAIL_SLEEP_DEFAULT=30
+INJECT_CONFIRM_RETRIES_DEFAULT=3
+INJECT_CONFIRM_SLEEP_DEFAULT=0.5
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
 CRASH_NORMAL_SLEEP_DEFAULT=5
 LOG_MAX_BYTES_DEFAULT=1048576
 LOG_KEEP_LINES_DEFAULT=2000
+
+# --- presence-gating + sentinel marker --------------------------------------
+# The in-band sentinel: ASCII unit separator (0x1f). Invisible and untypable on
+# a normal keyboard, so no real user message starts with it. Every daemon
+# injection is prefixed with this byte; firstmate treats a leading marker as an
+# internal escalation (stay afk) and its absence as "captain is back" (exit afk).
+# Portable across harnesses: it travels with the message text, independent of
+# any harness-level typed-vs-injected distinction.
+FM_INJECT_MARK=$'\x1f'
+AFK_FLAG_NAME=".afk"
 
 # Resolve the effective state dir. FM_STATE_OVERRIDE wins (testing); otherwise
 # $FM_ROOT/state, computed in fm_super_main. Kept as a function so the pure
@@ -99,6 +132,84 @@ _file_age() {  # seconds since mtime; very large if missing
 _hash_text() {
   if command -v md5 >/dev/null 2>&1; then printf '%s' "$1" | md5 -q
   else printf '%s' "$1" | md5sum | cut -d ' ' -f1; fi
+}
+
+# --- presence-gating helpers (PURE-ish: side-effect-free reads of state) -----
+# afk_active: 0 if the durable away-mode flag exists, 1 otherwise.
+afk_active() {  # <state>
+  [ -e "$1/$AFK_FLAG_NAME" ]
+}
+
+# afk_enter / afk_exit: write/clear the away-mode flag. Called by the /afk
+# skill (enter) and by firstmate on user return (exit). Durable: a plain file,
+# so recovery (§5) re-enters afk if it is present after a restart.
+afk_enter() {  # <state>
+  mkdir -p "$1"
+  date '+%s' > "$1/$AFK_FLAG_NAME"
+}
+
+afk_exit() {  # <state>
+  rm -f "$1/$AFK_FLAG_NAME"
+}
+
+# should_exit_afk: encodes firstmate's afk-exit contract as a testable function.
+#   afk inactive            -> 1 (nothing to exit)
+#   message has marker      -> 1 (internal escalation; stay afk)
+#   message is /afk command -> 1 (re-entering/extending afk; stay afk)
+#   anything else           -> 0 (captain is back; exit afk)
+# Bias toward exit: only the marker and an explicit /afk invocation keep afk
+# alive. A false exit is self-correcting (the captain re-runs /afk).
+should_exit_afk() {  # <state> <message-text>
+  local state=$1 msg=$2
+  afk_active "$state" || return 1
+  message_is_injection "$msg" && return 1
+  case "$msg" in
+    /afk*) return 1 ;;
+  esac
+  return 0
+}
+
+# message_is_injection: 0 if the given message text starts with the sentinel
+# marker (a daemon escalation), 1 otherwise (a real user message). Firstmate's
+# afk-exit contract uses this: marker present -> stay afk; absent -> captain is
+# back. Bias ambiguous cases toward exit (a false exit is self-correcting).
+message_is_injection() {  # <message-text>
+  local msg=$1
+  [ -n "$msg" ] || return 1
+  case "$msg" in
+    "$FM_INJECT_MARK"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Collapse all newlines to a literal " - " separator so the injected digest is
+# a single line. Submission via send-keys + Enter is then unambiguous regardless
+# of how the target TUI handles embedded newlines in its composer.
+_collapse_newlines() {  # <text>
+  local s=$1
+  s=${s//$'\n'/ - }
+  printf '%s' "$s"
+}
+
+# Auto-discover the supervisor pane at startup. Priority:
+#   1. FM_SUPERVISOR_TARGET env (explicit override) — caller passes it in.
+#   2. $TMUX_PANE — tmux sets this in every pane's environment; inherited by
+#      the daemon when the /afk skill launches it from firstmate's own pane.
+#   3. firstmate:0 — legacy fallback (may not resolve if the session is named
+#      differently). The caller logs a warning in that case.
+# Returns the resolved target on stdout; returns 1 if only the fallback is left
+# AND the fallback does not resolve to a live pane.
+discover_supervisor_target() {
+  if [ -n "${FM_SUPERVISOR_TARGET:-}" ]; then
+    printf '%s' "$FM_SUPERVISOR_TARGET"
+    return 0
+  fi
+  if [ -n "${TMUX_PANE:-}" ]; then
+    printf '%s' "$TMUX_PANE"
+    return 0
+  fi
+  printf '%s' "$FM_SUPERVISOR_TARGET_DEFAULT"
+  return 1
 }
 
 # --- classification helpers (PURE: no side effects, testable) ---------------
@@ -241,8 +352,9 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
-# Flush the escalation buffer as ONE batched digest to the supervisor pane.
-# Returns 0 on successful inject (or empty buffer), non-zero on inject failure.
+# Flush the escalation buffer as ONE batched, single-line digest to the
+# supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
+# inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
   local state=$1 buf item n msg
   buf="$state/.subsuper-escalations"
@@ -250,8 +362,10 @@ escalate_flush() {  # <state>
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  msg=$(printf 'Supervisor escalate (%s event(s), batched):\n%s\nStatus pre-read by sub-supervisor. Re-arm not needed (watcher is daemon-managed).' "$n" "$msg")
-  if inject_msg "$msg"; then : > "$buf"; rm -f "${buf}.since"; return 0; fi
+  # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
+  # safety net, but keeping the source single-line makes the intent explicit).
+  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since"; return 0; fi
   return 1
 }
 
@@ -338,17 +452,56 @@ window_for_task() {  # <task-key>
 }
 
 # --- injection --------------------------------------------------------------
-inject_msg() {  # <message>  -> 0 ok, non-zero if pane gone / send-keys failed
-  local msg=$1
-  if ! tmux display-message -p -t "${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}" '#{pane_id}' >/dev/null 2>&1; then
+# inject_msg: send one escalation digest to the supervisor pane.
+# Returns 0 on successful inject, non-zero if the pane is gone, the supervisor
+# is busy, afk is inactive, or the turn-started confirmation fails after
+# bounded retries. On non-zero the caller preserves the buffer so the
+# escalation survives for the next cycle or the catch-up flush.
+inject_msg() {  # <message> [state]
+  local msg=$1 state target i before after retries sleep_s
+  state="${2:-$(_state_root)}"
+  # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
+  # daemon self-handles and stays quiet; firstmate drives the base one-shot
+  # watcher. Escalations buffer and survive for the next catch-up flush.
+  afk_active "$state" || { log "inject deferred: afk inactive"; return 1; }
+  # (2) Single-line digest: collapse any embedded newlines so submission via
+  # send-keys + Enter is unambiguous regardless of how the TUI composer treats
+  # them. Then prepend the sentinel marker — firstmate's afk-exit contract
+  # keys off its presence at the start of the message.
+  msg=$(_collapse_newlines "$msg")
+  msg="${FM_INJECT_MARK}${msg}"
+  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1 || return 1
+  # (3) Busy-guard: never inject into an in-use pane. Defer; the buffered
+  # escalation survives in state/.subsuper-escalations. In afk mode this is
+  # belt-and-suspenders (no human is typing), but it also protects against
+  # firstmate being mid-turn when the escalation fires.
+  if pane_is_busy "$target"; then
+    log "inject deferred: supervisor pane busy"
     return 1
   fi
-  if tmux send-keys -t "${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}" -l "$msg" 2>/dev/null; then
-    sleep 0.3
-    if tmux send-keys -t "${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}" Enter 2>/dev/null; then
-      return 0
+  # (4) Turn-started confirmation: verify the pane content changed after
+  # Enter. A swallowed Enter (popup, focus elsewhere) must not lose the
+  # escalation silently; retry with bounded attempts.
+  retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
+  sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
+  i=0
+  while [ "$i" -lt "$retries" ]; do
+    i=$((i + 1))
+    before=$(tmux capture-pane -p -t "$target" -S -5 2>/dev/null | tail -3) || before=""
+    if tmux send-keys -t "$target" -l "$msg" 2>/dev/null; then
+      sleep "$sleep_s"
+      if tmux send-keys -t "$target" Enter 2>/dev/null; then
+        sleep "$sleep_s"
+        after=$(tmux capture-pane -p -t "$target" -S -5 2>/dev/null | tail -3) || after=""
+        if [ "$before" != "$after" ]; then
+          return 0
+        fi
+      fi
     fi
-  fi
+    sleep "$sleep_s"
+  done
+  log "inject failed after $retries retries (pane content unchanged)"
   return 1
 }
 
@@ -446,7 +599,6 @@ fm_super_main() {
   local WATCH_ERR="$STATE/.supervise-daemon.watcher.err"
   local LOCK="$STATE/.supervise-daemon.lock"
   local PIDFILE="$STATE/.supervise-daemon.pid"
-  local TARGET="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   local INJECT_FAIL_SLEEP=${FM_INJECT_FAIL_SLEEP:-$INJECT_FAIL_SLEEP_DEFAULT}
   local CRASH_THRESHOLD=${FM_CRASH_THRESHOLD:-$CRASH_THRESHOLD_DEFAULT}
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
@@ -463,6 +615,21 @@ fm_super_main() {
   fi
   echo "$$" > "$PIDFILE"
 
+  # --- auto-discover the supervisor target (the pane running firstmate) -----
+  # Priority: FM_SUPERVISOR_TARGET override > $TMUX_PANE (inherited from the
+  # pane that launched the daemon, normally firstmate's own) > firstmate:0
+  # fallback. Exporting the result into FM_SUPERVISOR_TARGET makes inject_msg
+  # (which reads that env var) use the discovered pane without an extra global.
+  local discovered fallback
+  if discovered=$(discover_supervisor_target); then
+    : # explicit override or TMUX_PANE — resolved cleanly
+  else
+    fallback="$discovered"
+    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET or TMUX_PANE); falling back to '$fallback'" >&2
+  fi
+  FM_SUPERVISOR_TARGET="$discovered"
+  local TARGET="$FM_SUPERVISOR_TARGET"
+
   # --- validate supervisor target at startup (a missing target is a typo) ---
   if ! tmux display-message -p -t "$TARGET" '#{pane_id}' >/dev/null 2>&1; then
     echo "error: supervisor target '$TARGET' does not resolve to a tmux pane; set FM_SUPERVISOR_TARGET" >&2
@@ -471,7 +638,9 @@ fm_super_main() {
     exit 1
   fi
 
-  log "daemon starting (pid $$); target=$TARGET; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  local afk_status="off"
+  afk_active "$STATE" && afk_status="on"
+  log "daemon starting (pid $$); target=$TARGET; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
