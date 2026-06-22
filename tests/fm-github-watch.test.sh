@@ -223,9 +223,9 @@ test_losslessness_redetects_when_seen_write_fails() {
   # New comment arrives.
   printf '7\n' > "$dir/fixture/comments-kunchenguid-firstmate-30"
 
-  # Simulate a failing seen write: make the seen dir read-only so the mv in
-  # apply_pending cannot advance the marker. The event must STILL print this
-  # cycle (print happens before the seen write).
+  # Simulate a failing seen write: make the seen dir read-only so atomic_write
+  # cannot advance the marker. The event must STILL print this cycle (print
+  # happens before the seen write).
   chmod a-w "$dir/state/.github-watch-seen"
   out=$(run_poll "$dir")
   chmod u+w "$dir/state/.github-watch-seen"
@@ -385,6 +385,27 @@ test_ci_carry_forward_across_empty_window() {
   pass "CI signature carries forward across an empty window and fires on change"
 }
 
+test_all_filters_off_mutes_watcher() {
+  local dir out
+  dir=$(make_case all-off)
+  seed_prs "$dir" $'kunchenguid/firstmate\t30'
+  printf '5\n' > "$dir/fixture/comments-kunchenguid-firstmate-30"
+  run_poll "$dir" >/dev/null   # baseline
+
+  # Turn every filter off; the persisted config must keep filters empty (not
+  # fall back to defaults).
+  for f in comments ci reviews merge; do
+    FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" filter "$f" off >/dev/null
+  done
+  grep -Fxq 'filters=' "$dir/state/.github-watch-config" || fail "all-off should write filters= (empty), not default"
+
+  # A new comment must NOT fire (every filter is muted).
+  printf '9\n' > "$dir/fixture/comments-kunchenguid-firstmate-30"
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "muted watcher emitted events; got: $out"
+  pass "all filters off (empty filters=) mutes the watcher instead of resetting to defaults"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -395,3 +416,4 @@ test_review_detection
 test_ci_detection
 test_merge_filter_suppresses_merge_event
 test_ci_carry_forward_across_empty_window
+test_all_filters_off_mutes_watcher
