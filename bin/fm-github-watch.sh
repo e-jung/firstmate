@@ -344,7 +344,9 @@ poll_once() {
     [ -n "${fullname:-}" ] || continue
     owner=${fullname%%/*}
     repo=${fullname#*/}
-    { [ -n "$owner" ] && [ -n "$repo" ] && [ "$owner" != "$fullname" ] && [ -n "${pr:-}" ]; } || continue
+    if [ -z "$owner" ] || [ -z "$repo" ] || [ "$owner" = "$fullname" ] || [ -z "${pr:-}" ]; then
+      continue
+    fi
     process_pr "$owner" "$repo" "$pr" "$contributor"
     basename=$(seen_file "$owner" "$repo" "$pr"); basename=${basename##*/}
     open_basenames="${open_basenames}${basename} "
@@ -386,7 +388,7 @@ detect_left_open() {
     owner=$(seen_get "$f" owner)
     repo=$(seen_get "$f" repo)
     pr=$(seen_get "$f" pr)
-    [ -n "$owner" ] && [ -n "$repo" ] && [ -n "$pr" ] || continue
+    if [ -z "$owner" ] || [ -z "$repo" ] || [ -z "$pr" ]; then continue; fi
     p_state=$(pr_state "$owner" "$repo" "$pr")
     [ -n "$p_state" ] || continue   # transient gh failure: leave seen state untouched
     [ "$p_state" = "$seen_state" ] && continue   # unchanged: no event, no rewrite
