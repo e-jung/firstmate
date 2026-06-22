@@ -51,6 +51,10 @@ CONFIG="$STATE/.github-watch-config"
 SEEN_DIR="$STATE/.github-watch-seen"
 ALL_FILTERS="comments,ci,reviews,merge"
 DEFAULT_POLL_SECS="${FM_GH_POLL_SECS:-300}"
+# How long after a PR closes to keep re-probing it for a close->reopen->merge.
+# Bounds API cost: a closed PR is re-checked only within this window, then
+# treated as settled. ~2h at the default 300s poll.
+CLOSE_REPROBE_SECS="${FM_GH_CLOSE_REPROBE_SECS:-7200}"
 
 mkdir -p "$STATE" "$SEEN_DIR"
 
@@ -353,15 +357,16 @@ EOF
 
 # Detect PRs that left the open search (merged or closed) since the last poll.
 # For each, emit a state transition and advance its seen state. Only MERGED is
-# terminal: a CLOSED PR can be reopened and later merged, so CLOSED (and OPEN)
-# PRs are re-probed each cycle until they settle to MERGED. Re-probing is
-# bounded by the seen set (PRs once seen open, not yet merged).
-# detect_left_open <open-basenames>  (space-padded: " key1 key2 " so the last
-# entry matches too).
+# terminal: a CLOSED PR can be reopened and later merged, so CLOSED PRs are
+# re-probed within a bounded window (CLOSE_REPROBE_SECS after they closed) so a
+# close->reopen->merge still fires, without an unbounded per-cycle API cost as
+# closed PRs accumulate. detect_left_open <open-basenames> (space-padded:
+# " key1 key2 " so the last entry matches too).
 detect_left_open() {
-  local open_basenames=$1 f base owner repo pr seen_state p_state block
+  local open_basenames=$1 f base owner repo pr seen_state p_state block closed_at now
   filter_enabled merge || return 0
   [ -d "$SEEN_DIR" ] || return 0
+  now=$(date +%s)
   for f in "$SEEN_DIR"/*; do
     [ -e "$f" ] || continue
     base=${f##*/}
@@ -370,6 +375,14 @@ detect_left_open() {
     [ -n "$(seen_get "$f" initialized)" ] || continue
     seen_state=$(seen_get "$f" state)
     [ "$seen_state" = "MERGED" ] && continue   # merged is the only terminal state
+    # A CLOSED PR older than the re-probe window is settled: skip the API call
+    # so accumulated closed PRs cannot push the fleet past the rate limit.
+    if [ "$seen_state" = "CLOSED" ]; then
+      closed_at=$(seen_get "$f" closed_at)
+      if [ -n "$closed_at" ] && [ $((now - closed_at)) -ge "$CLOSE_REPROBE_SECS" ]; then
+        continue
+      fi
+    fi
     owner=$(seen_get "$f" owner)
     repo=$(seen_get "$f" repo)
     pr=$(seen_get "$f" pr)
@@ -387,7 +400,12 @@ detect_left_open() {
         # so a later merge still fires from the right baseline.
         ;;
     esac
-    block=$(awk -F= -v s="$p_state" '$1!="state" { print } END { print "state=" s }' "$f")
+    # Rewrite state; stamp closed_at when entering CLOSED so the re-probe window
+    # can age it out, and clear it on any other transition.
+    local cat=""
+    [ "$p_state" = "CLOSED" ] && cat=$now
+    block=$(awk -F= -v s="$p_state" -v cat="$cat" \
+      '$1!="state" && $1!="closed_at" { print } END { print "state=" s; if (cat != "") print "closed_at=" cat }' "$f")
     atomic_write "$f" "$block"
   done
 }
