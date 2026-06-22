@@ -148,7 +148,8 @@ test_filter_toggling() {
   # Turn comments off -> persisted in config, absent from list.
   FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" filter comments off > "$dir/off.out"
   grep -Eq '^filters=ci,reviews,merge$' "$dir/off.out" || fail "turning comments off gave unexpected result"
-  ! grep -Fxq comments "$cfg" || fail "comments should be removed from config when toggled off"
+  ! awk -F= '/^filters=/{print $2}' "$cfg" | grep -qw comments \
+    || fail "comments should be absent from filters= when toggled off"
 
   # Turn comments back on.
   FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" filter comments on > "$dir/on.out"
@@ -336,6 +337,54 @@ test_ci_detection() {
   pass "CI signature change emits CI event"
 }
 
+test_merge_filter_suppresses_merge_event() {
+  local dir out
+  dir=$(make_case merge-off)
+  seed_prs "$dir" $'kunchenguid/firstmate\t42'
+  printf 'OPEN\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  run_poll "$dir" >/dev/null   # baseline
+
+  # Disable the merge filter; the PR then merges (leaves the open set).
+  FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" filter merge off >/dev/null
+  : > "$dir/fixture/prs"
+  printf 'MERGED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(run_poll "$dir")
+  if printf '%s\n' "$out" | grep -Fq "MERGED"; then
+    fail "merge event fired despite merge filter being off; got: $out"
+  fi
+  pass "merge filter off suppresses merge/close events"
+}
+
+test_ci_carry_forward_across_empty_window() {
+  local dir out sf
+  dir=$(make_case ci-carry)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t310'
+  printf 'sha1\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
+  printf 'success,success\n' > "$dir/fixture/ci-sha1"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-310"
+
+  # Baseline: CI passing for sha1.
+  run_poll "$dir" >/dev/null
+  grep -Fxq "ci=success,success" "$sf" || fail "baseline ci not recorded"
+
+  # New commit: sha changes, check-runs not populated yet (empty ci_sig).
+  printf 'sha2\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
+  rm -f "$dir/fixture/ci-sha1"
+  # No ci-sha2 fixture yet -> ci_signature returns empty.
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "transient empty ci window should be silent; got: $out"
+  # seen_ci must be carried forward (not dropped) so a later change still fires.
+  grep -Fxq "ci=success,success" "$sf" || fail "ci signature was dropped during empty window"
+
+  # CI completes for sha2 and FAILS: signature differs from carried-forward.
+  printf 'failure,success\n' > "$dir/fixture/ci-sha2"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 checks changed" \
+    || fail "ci completion after empty window did not fire; got: $out"
+
+  pass "CI signature carries forward across an empty window and fires on change"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -344,3 +393,5 @@ test_merge_detection_on_left_open
 test_config_roundtrip
 test_review_detection
 test_ci_detection
+test_merge_filter_suppresses_merge_event
+test_ci_carry_forward_across_empty_window

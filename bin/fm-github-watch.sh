@@ -10,6 +10,10 @@
 #   ln -s ../bin/fm-github-watch.sh state/github-events.check.sh
 # bin/fm-watch.sh runs state/*.check.sh every FM_CHECK_INTERVAL (default
 # 300s); any stdout is captured, classified as a `check` wake, escalated.
+# A full poll issues up to 5 serial gh calls per open PR; for a large fleet
+# that can approach the watcher's 30s check-script timeout. Events emit
+# per-PR (not all-at-end), so a timeout still surfaces partial progress,
+# but for very large fleets prefer --daemon, which is not timeout-bound.
 #
 # Usage:
 #   fm-github-watch.sh                 # one poll cycle (same as --once)
@@ -24,6 +28,10 @@
 # Filter names: comments, ci, reviews, merge.
 # Config: state/.github-watch-config (key=value lines).
 # Seen:   state/.github-watch-seen/<owner>-<repo>-<pr> (key=value lines).
+#
+# The ci filter reads the Checks API (check-runs); CI providers that report
+# only via the legacy commit status API (some older Travis/Coveralls setups)
+# are not covered. Use `gh pr checks` directly for a unified view.
 #
 # Losslessness: for each PR, events are emitted BEFORE its seen marker advances
 # (and bash's builtin printf write()s to the capture pipe immediately, so an
@@ -197,11 +205,14 @@ atomic_write() {
 # Compose the seen-state block: high-water marks for counts, current value for
 # ci/state. Fields with no fresh value this cycle are carried forward from the
 # prior block, so toggling a filter off never wipes its remembered high-water.
+# CI is carried forward across a transiently-empty fetch (a new commit whose
+# check-runs have not populated yet) so a later status change still fires.
 build_seen() {
   local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_sig=$7 sha=$8 p_state=$9
-  local seen_c seen_r new_c new_r block
+  local seen_c seen_r seen_ci new_c new_r ci_val block
   seen_c=$(seen_get "$sf" comments)
   seen_r=$(seen_get "$sf" reviews)
+  seen_ci=$(seen_get "$sf" ci)
   new_c=$seen_c; new_r=$seen_r
   if is_int "$c_count"; then
     if is_int "$seen_c"; then new_c=$((seen_c > c_count ? seen_c : c_count)); else new_c=$c_count; fi
@@ -209,12 +220,14 @@ build_seen() {
   if is_int "$r_count"; then
     if is_int "$seen_r"; then new_r=$((seen_r > r_count ? seen_r : r_count)); else new_r=$r_count; fi
   fi
+  ci_val=$ci_sig
+  [ -n "$ci_val" ] || ci_val=$seen_ci
   block=$(printf 'owner=%s\nrepo=%s\npr=%s\ninitialized=1' "$owner" "$repo" "$pr")
-  is_int "$new_c"   && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
-  is_int "$new_r"   && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
-  [ -n "$ci_sig" ]  && block=$(printf '%s\nci=%s'       "$block" "$ci_sig")
-  [ -n "$sha" ]     && block=$(printf '%s\nsha=%s'      "$block" "$sha")
-  [ -n "$p_state" ] && block=$(printf '%s\nstate=%s'    "$block" "$p_state")
+  is_int "$new_c"    && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
+  is_int "$new_r"    && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
+  [ -n "$ci_val" ]   && block=$(printf '%s\nci=%s'       "$block" "$ci_val")
+  [ -n "$sha" ]      && block=$(printf '%s\nsha=%s'      "$block" "$sha")
+  [ -n "$p_state" ]  && block=$(printf '%s\nstate=%s'    "$block" "$p_state")
   printf '%s' "$block"
 }
 
@@ -313,6 +326,7 @@ EOF
 # entry matches too).
 detect_left_open() {
   local open_basenames=$1 f base owner repo pr seen_state p_state block
+  filter_enabled merge || return 0
   [ -d "$SEEN_DIR" ] || return 0
   for f in "$SEEN_DIR"/*; do
     [ -e "$f" ] || continue
