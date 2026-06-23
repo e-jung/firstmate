@@ -85,7 +85,38 @@
 #          the daemon; a tight crash-restart spin is detected and backed off.
 set -u
 
+# --- canonical-home resolution + worktree-launch guard ----------------------
+# ROOT CAUSE (2026-06-22 double-daemon freeze): the state root — and thus the
+# singleton lock state/.supervise-daemon.lock — was derived from the script's
+# own location (dirname $0 / ..). A daemon launched from inside a git worktree
+# therefore resolved state/ to the WORKTREE's state dir: a different inode than
+# the canonical daemon's state/.supervise-daemon.lock. Both daemons believed
+# they were the sole instance; both injected; their retry loops wedged the
+# supervisor pane.
+#
+# FIX. The canonical firstmate home is selected exactly the way the rest of the
+# fleet does it (fm-watch.sh / fm-wake-lib.sh / fm-lock.sh): FM_HOME wins
+# (AGENTS.md §2), then FM_STATE_OVERRIDE (a state dir), then a script-dir
+# fallback. The script-dir fallback is ONLY correct when it is the main
+# checkout (not a linked worktree); when it is a worktree, it would silently
+# lock a worktree-local state dir. In this fleet a worktree's git-common-dir
+# points at a DEV clone rather than the canonical home, so the real root cannot
+# be safely auto-resolved from a worktree. We therefore hard-REFUSE a worktree
+# launch that has no explicit canonical selector (belt-and-suspenders guard).
+# An explicit FM_HOME / FM_STATE_OVERRIDE / FM_ROOT_OVERRIDE is an intentional
+# canonical selection and is trusted even from a worktree. Hard-refuse is the
+# safe, simple choice for a singleton supervisor (documented here per the task).
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Record which canonical selectors the operator set EXPLICITLY (non-empty),
+# captured BEFORE FM_HOME is defaulted to the script-dir fallback below. The
+# worktree-launch guard uses these to tell an intentional canonical selection
+# apart from the silent script-dir fallback. They are intentionally public so
+# the guard (and its tests) can reason about them directly.
+_FM_HOME_SET=0;          [ -n "${FM_HOME:-}" ] && _FM_HOME_SET=1
+_FM_STATE_SET=0;         [ -n "${FM_STATE_OVERRIDE:-}" ] && _FM_STATE_SET=1
+_FM_ROOT_OVERRIDE_SET=0; [ -n "${FM_ROOT_OVERRIDE:-}" ] && _FM_ROOT_OVERRIDE_SET=1
+
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_DAEMON_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
@@ -131,6 +162,48 @@ AFK_FLAG_NAME=".afk"
 # $FM_HOME/state. Kept as a function so the pure
 # classifiers can take an explicit state arg without depending on globals.
 _state_root() { printf '%s' "${FM_STATE_OVERRIDE:-$FM_HOME/state}"; }
+
+# --- worktree detection (pure-ish: read-only git queries, no side effects) ----
+# Resolve a path that git prints (possibly relative to <base>) to an absolute,
+# symlink-resolved real path. git rev-parse --git-dir / --git-common-dir print
+# paths relative to the cwd they were invoked from inside the main checkout,
+# and absolute paths inside a linked worktree.
+_fm_git_abs_path() {  # <base> <path>
+  local base=$1 p=$2
+  case "$p" in
+    /*) cd "$p" 2>/dev/null && pwd -P ;;
+    *)  cd "$base" 2>/dev/null && cd "$p" 2>/dev/null && pwd -P ;;
+  esac
+}
+
+# 0 if <dir> is a LINKED git worktree (not the main checkout). In a linked
+# worktree the git dir lives under <common>/.git/worktrees/<name> and differs
+# from git-common-dir; in the main checkout they resolve to the same path.
+# Returns 1 (not a worktree) when git is unavailable or <dir> is not a repo, so
+# the absence of git never blocks the daemon.
+_fm_in_git_worktree() {  # <dir>
+  local base=$1 gd cd_abs
+  command -v git >/dev/null 2>&1 || return 1
+  gd=$(cd "$base" 2>/dev/null && git rev-parse --git-dir 2>/dev/null) || return 1
+  [ -n "$gd" ] || return 1
+  cd_abs=$(cd "$base" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || return 1
+  [ -n "$cd_abs" ] || return 1
+  gd=$(_fm_git_abs_path "$base" "$gd");        [ -n "$gd" ] || return 1
+  cd_abs=$(_fm_git_abs_path "$base" "$cd_abs"); [ -n "$cd_abs" ] || return 1
+  [ "$gd" != "$cd_abs" ]
+}
+
+# 0 if the daemon should REFUSE to start because it was launched from a git
+# worktree with no explicit canonical home/state selector. See the root-cause
+# note at the top of this file. The explicit-selector flags (_FM_*_SET) are
+# captured before FM_HOME is defaulted, so an operator-provided FM_HOME /
+# FM_STATE_OVERRIDE / FM_ROOT_OVERRIDE is trusted even from a worktree.
+_daemon_refuses_worktree_launch() {  # <daemon-dir>
+  [ "${_FM_HOME_SET:-0}" = 1 ] && return 1
+  [ "${_FM_STATE_SET:-0}" = 1 ] && return 1
+  [ "${_FM_ROOT_OVERRIDE_SET:-0}" = 1 ] && return 1
+  _fm_in_git_worktree "$1"
+}
 
 # --- portable stat (same trap as fm-watch.sh: no `stat -f || stat -c`) -------
 if [ "$(uname)" = Darwin ]; then
@@ -681,6 +754,27 @@ trim_log() {
 fm_super_main() {
   local STATE
   STATE="$(_state_root)"
+
+  # --- worktree-launch guard (2026-06-22 double-daemon freeze) --------------
+  # Refuse to run when launched from a linked git worktree with no explicit
+  # canonical selector. Without this, the script-dir fallback resolves state/
+  # (and the singleton lock) to the worktree — a DIFFERENT inode than the
+  # canonical daemon's — so two daemons each believe they are the sole instance
+  # and wedge the supervisor pane. In this fleet a worktree's git-common-dir
+  # points at a dev clone, not the canonical home, so we cannot safely resolve
+  # the real root; refusing is the safe, simple choice. An explicit FM_HOME /
+  # FM_STATE_OVERRIDE / FM_ROOT_OVERRIDE overrides the refusal. See the
+  # root-cause note at the top of this file.
+  if _daemon_refuses_worktree_launch "$FM_DAEMON_DIR"; then
+    cat >&2 <<'EOF'
+error: fm-supervise-daemon refused: launched from a git worktree with no
+canonical home selector. Run it from the canonical firstmate root (or set
+FM_HOME / FM_STATE_OVERRIDE), not a worktree. A worktree launch would lock a
+worktree-local state dir and bypass the canonical singleton lock.
+EOF
+    exit 1
+  fi
+
   mkdir -p "$STATE"
 
   # Source the portable lock helpers (mkdir-based, works on macOS where flock
