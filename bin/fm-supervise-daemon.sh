@@ -106,7 +106,21 @@ CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green
 # the composer is empty (safe to inject); a non-match with non-whitespace content
 # means there is pending input (defer). Err on the side of treating unrecognized
 # content as pending (false positives are cheap — just a deferred cycle).
-COMPOSER_IDLE_RE_DEFAULT='^[[:space:]]*(\$|>|❯|%|#)[[:space:]]*$|esc (to )?interrupt|Working\.\.\.'
+#
+# opencode idle rendering (verified against opencode 1.17.x, the captain's
+# harness): opencode does NOT show a bare prompt on the cursor line. Its composer
+# is a bordered input widget. At a clean idle prompt the cursor line renders as:
+#     <indent>┃  Ask anything... "<dynamic suggestion>"
+# where ┃ is U+2503 (box-drawing heavy vertical, the widget's left border) and
+# "Ask anything..." is the FIXED empty-composer placeholder (followed by a quoted
+# suggestion that changes per render). When the user types, the placeholder is
+# REPLACED by their text, so the cursor line becomes "<indent>┃  <typed text>".
+# The empty-composer signal is therefore: cursor line starts with a box-drawing
+# vertical border followed by either only whitespace (border-only chrome) or the
+# "Ask anything..." placeholder. A typed line ("┃  hello") matches neither, so it
+# is still correctly treated as pending input. Requires a UTF-8 locale (C.UTF-8),
+# the same assumption the existing ❯ alternative already makes.
+COMPOSER_IDLE_RE_DEFAULT='^[[:space:]]*(\$|>|❯|%|#)[[:space:]]*$|esc (to )?interrupt|Working\.\.\.|^[[:space:]]*[┃│][[:space:]]*$|^[[:space:]]*[┃│][[:space:]]*Ask anything\.\.\.'
 INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
@@ -258,6 +272,22 @@ window_to_task() {
   t="${w##*:}"; t="${t#fm-}"; printf '%s' "$t"
 }
 
+# A CREWMATE pane is a tmux window whose name (after the "<session>:" prefix)
+# starts with "fm-". Only crewmate panes are subjects of the daemon's stale-wedge
+# detection. The supervisor's own pane — the opencode/claude/etc. window that runs
+# firstmate — is legitimately idle between events while the captain is away;
+# flagging it as a possible wedge floods the escalation buffer with false alarms
+# every cycle. Any window that is not a crewmate window (the supervisor pane, bare
+# session windows, etc.) is excluded from stale tracking. Returns 0 for crewmate.
+is_crewmate_window() {  # <window-target>
+  local w=$1 name
+  name="${w##*:}"   # "<session>:<window>" -> "<window>"; unchanged if no colon
+  case "$name" in
+    fm-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Decision protocol: every classifier prints exactly one line on stdout of the
 # form "<action>|<distilled>" where action is "self" or "escalate". The distilled
 # field for "self" is informational (logged); for "escalate" it is the pre-read
@@ -298,6 +328,16 @@ classify_signal() {  # <reason-after-colon> <state>
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
+  # Stale-wedge detection applies ONLY to crewmate panes (fm-* windows). The
+  # supervisor's own pane is expected to idle between events while the captain is
+  # away; treating its idle as a wedge floods the escalation buffer with false
+  # alarms. A non-crewmate window self-handles here with NO marker recorded, so
+  # housekeeping's persistence recheck can never age it into a false wedge. (The
+  # same guard lives in stale_marker_record as a defensive choke point.)
+  if ! is_crewmate_window "$win"; then
+    printf 'self|stale ignored: non-crewmate pane (supervisor pane idle is healthy): %s' "$win"
+    return
+  fi
   task=$(window_to_task "$win")
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
@@ -341,6 +381,11 @@ _stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
 
 stale_marker_record() {  # <window> <state>  — create if absent
   local win=$1 state=$2 key marker
+  # Defensive choke point: never track a non-crewmate pane (e.g. the supervisor's
+  # own pane). classify_stale already short-circuits these, but this guarantees
+  # no caller path — including a future one — can create a stale marker for the
+  # supervisor pane that housekeeping would later age into a false wedge.
+  is_crewmate_window "$win" || return 0
   key=$(_stale_key "$(window_to_task "$win")")
   marker="$state/.subsuper-stale-$key"
   [ -e "$marker" ] || _now > "$marker"

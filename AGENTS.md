@@ -172,12 +172,15 @@ Resume after exit: `codex resume <session-id>` (printed on quit).
 | Fact | Value |
 |---|---|
 | Busy-pane signature | `esc interrupt` (dotted spinner footer; note: no "to") |
+| Idle-composer cursor line | `<indent>┃  Ask anything... "<suggestion>"` — bordered input widget (┃ U+2503) + fixed "Ask anything..." placeholder; typed text REPLACES the placeholder |
 | Exit command | `/exit` |
 | Interrupt | double Escape; known flaky while a long shell command runs - a wedged pane may need `/exit` and relaunch |
 
 No trust dialog.
 Caution: opencode auto-upgrades itself in the background and the running TUI can exit mid-task (observed live: 1.15.7 -> 1.17.3).
 If a pane shows the exit banner, relaunch with `--continue` to resume the session - but `--prompt` does NOT auto-submit alongside `--continue`; send the next instruction via fm-send once the TUI is up.
+
+opencode's composer is a bordered widget, not a bare prompt: at a clean idle prompt the cursor line shows a box-drawing left border (`┃`) plus the fixed `Ask anything...` empty-input placeholder (and a quoted suggestion that varies). `fm-supervise-daemon.sh`'s `COMPOSER_IDLE_RE_DEFAULT` recognizes this so `pane_input_pending` does not false-positive on the supervisor's idle pane (verified against opencode 1.17.x). If opencode changes its placeholder/border, the regex is the place to update; failing to match is fail-safe (injections defer rather than corrupt).
 
 ### pi (VERIFIED 2026-06-11)
 
