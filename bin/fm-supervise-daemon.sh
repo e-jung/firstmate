@@ -162,6 +162,21 @@ CRASH_NORMAL_SLEEP_DEFAULT=5
 LOG_MAX_BYTES_DEFAULT=1048576
 LOG_KEEP_LINES_DEFAULT=2000
 
+# --- optional config file (config/daemon.conf) ------------------------------
+# Source a per-fleet config file if present. The file assigns FM_* knobs in
+# `FM_X=${FM_X:-value}` form so an explicit env var still wins (precedence:
+# env > config file > built-in default). `set -a` exports the assignments so
+# they also flow to child processes (fm-watch.sh, *.check.sh plugins) exactly
+# as an env var would — that is what lets knobs like FM_CHECK_INTERVAL (read by
+# fm-watch.sh) or FM_DISK_ALERT_PCT (read by a disk-health check script) be
+# tuned from this one file. config/daemon.conf is local (gitignored, like
+# config/crew-harness); create and edit it with bin/fm-config.sh. Absent here
+# (tests, fresh clones) this block is a no-op.
+# shellcheck source=/dev/null
+if [ -f "$FM_ROOT/config/daemon.conf" ]; then
+  set -a; . "$FM_ROOT/config/daemon.conf"; set +a
+fi
+
 # --- presence-gating + sentinel marker --------------------------------------
 # The in-band sentinel: ASCII unit separator (0x1f). Invisible and untypable on
 # a normal keyboard, so no real user message starts with it. Every daemon

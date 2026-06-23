@@ -358,10 +358,23 @@ do_vacuum() {
   return 0
 }
 
+# Self-description for fm-plugin.sh (see PLUGINS.md). disk-health is REPORT-style:
+# --check always prints a status report, so it is NOT natively silent-unless-wake
+# and must be wrapped with a filter (e.g. --filter '^ALERT:') when used as a
+# watcher check script.
+do_describe() {
+  printf 'name=disk-health\n'
+  printf 'watches=disk usage, reclaimable caches, opencode.db growth\n'
+  printf 'config_keys=FM_DISK_ALERT_PCT FM_JOURNAL_KEEP FM_CACHE_SAFE_SUBDIRS FM_DISK_SKIP_NPM FM_DISK_SKIP_GO FM_DISK_SKIP_JOURNAL FM_DISK_SKIP_DOCKER FM_DISK_SKIP_CACHE FM_DISK_VACUUM_ON_CLEAN FM_OPENCODE_DB\n'
+  printf 'wake_contract=report\n'
+  printf 'recommended_wrapper=--check --filter ^ALERT:\n'
+}
+
 case "${1:---check}" in
   --check) do_check ;;
   --clean) do_clean ;;
   --vacuum-opencode-db) do_vacuum ;;
+  --describe) do_describe ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 1 ;;
 esac

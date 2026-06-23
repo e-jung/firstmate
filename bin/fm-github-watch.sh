@@ -485,10 +485,22 @@ usage() {
   awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
+# Self-description for fm-plugin.sh (see PLUGINS.md). github-watch is
+# silent-unless-wake: it prints one line per new PR event and nothing otherwise,
+# so it can be run raw as a watcher check script (no --filter needed).
+do_describe() {
+  printf 'name=github-watch\n'
+  printf 'watches=open PR comments, reviews, CI status, merge/close transitions\n'
+  printf 'config_keys=FM_GH_CONTRIBUTOR FM_GH_POLL_SECS FM_GH_CLOSE_REPROBE_SECS\n'
+  printf 'wake_contract=silent-unless-wake\n'
+  printf 'recommended_wrapper=--once\n'
+}
+
 # ---- entry ----
 
 case "${1:-}" in
   --help|-h) usage; exit 0 ;;
+  --describe) do_describe; exit 0 ;;
   --once|"") poll_once ;;
   --daemon) poll_daemon ;;
   filter) shift; cmd_filter "$@" ;;
