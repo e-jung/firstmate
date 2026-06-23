@@ -11,10 +11,10 @@
 #   ln -s ../bin/fm-github-watch.sh state/github-events.check.sh
 # bin/fm-watch.sh runs state/*.check.sh every FM_CHECK_INTERVAL (default
 # 300s); any stdout is captured, classified as a `check` wake, escalated.
-# A full poll issues up to 5 serial gh calls per open PR; for a large fleet
-# that can approach the watcher's 30s check-script timeout. Events emit
-# per-PR (not all-at-end), so a timeout still surfaces partial progress,
-# but for very large fleets prefer --daemon, which is not timeout-bound.
+# A full poll issues up to 5 gh calls per open PR, but PRs are polled
+# concurrently (bounded by FM_GH_CONCURRENCY, default 8) so a sweep across the
+# fleet finishes in well under the watcher's 30s check-script timeout. Events
+# emit per-PR (not all-at-end), so a timeout still surfaces partial progress.
 #
 # Usage:
 #   fm-github-watch.sh                 # one poll cycle (same as --once)
@@ -41,7 +41,8 @@
 # emitted event survives even a SIGKILL). A crash between the print and the seen
 # write at worst causes a redundant re-detect next cycle, never a permanent
 # swallow. A failing seen write leaves the old marker in place, so the same
-# event fires again next cycle.
+# event fires again next cycle. PRs are polled concurrently but each worker
+# owns its own per-PR seen file, so this ordering holds per-worker exactly.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,6 +56,11 @@ DEFAULT_POLL_SECS="${FM_GH_POLL_SECS:-300}"
 # Bounds API cost: a closed PR is re-checked only within this window, then
 # treated as settled. ~2h at the default 300s poll.
 CLOSE_REPROBE_SECS="${FM_GH_CLOSE_REPROBE_SECS:-7200}"
+# Max number of PRs polled concurrently in a single sweep. Bounded so a large
+# fleet can't burst GitHub's rate limit or hammer the API. ~88 calls/sweep at
+# the captain's ~22 PRs is well under the 5000/hr ceiling even at 12 sweeps/hr.
+# Set FM_GH_CONCURRENCY to tune (>=1; 0/non-numeric falls back to the default 8).
+DEFAULT_CONCURRENCY=8
 
 mkdir -p "$STATE" "$SEEN_DIR"
 
@@ -125,6 +131,13 @@ get_poll() {
   local v
   v=$(cfg_read poll_interval)
   case "${v:-}" in ''|*[!0-9]*) printf '%s' "$DEFAULT_POLL_SECS" ;; *) printf '%s' "$v" ;; esac
+}
+
+# Max concurrent per-PR workers in a sweep. FM_GH_CONCURRENCY overrides; a
+# missing, empty, non-numeric, or zero value falls back to the sane default.
+get_concurrency() {
+  local v="${FM_GH_CONCURRENCY:-}"
+  case "$v" in ''|*[!0-9]*|0) printf '%s' "$DEFAULT_CONCURRENCY" ;; *) printf '%s' "$v" ;; esac
 }
 
 # seen_file <owner> <repo> <pr> -> path to that PR's seen-state file
@@ -271,10 +284,9 @@ build_seen() {
 # then advance this PR's seen marker. Per-PR ordering (print before seen) plus
 # bash's immediate write() to the capture pipe make this lossless even if the
 # poll is killed mid-cycle: an emitted event is already in the pipe, and a PR
-# whose marker never advanced simply re-fires next cycle. Emitting per-PR (not
-# all-at-end) also means a watcher timeout surfaces partial progress instead of
-# nothing — important because the watcher wraps check scripts in a 30s timeout
-# and a full fleet poll of serial gh calls can approach that budget.
+# whose marker never advanced simply re-fires next cycle. Runs one worker per
+# PR under poll_once's bounded concurrency; each worker writes only this PR's
+# own seen file, so concurrent workers never contend on seen state.
 process_pr() {
   local owner=$1 repo=$2 pr=$3 contributor=$4
   local sf c_count r_count p_state sha ci_sig
@@ -337,9 +349,21 @@ process_pr() {
 poll_once() {
   local contributor prs fullname pr owner repo basename
   local open_basenames=" "
+  local max_jobs running
+  max_jobs=$(get_concurrency)
+  running=0
   contributor=$(get_contributor)
   prs=$(discover_prs)
 
+  # Parallel per-PR polling. Each worker is a subshell running process_pr; each
+  # owns its own seen file (seen_file is keyed by owner/repo/pr), so concurrent
+  # seen writes never collide. Concurrency is bounded by FM_GH_CONCURRENCY
+  # (default 8) via a counting semaphore so a large fleet can't burst the GitHub
+  # rate limit. Each worker prints its whole event block in a single printf
+  # (one write() of a few hundred bytes, atomic under PIPE_BUF, so lines never
+  # interleave), and only then advances its own seen marker — the losslessness
+  # invariant (print before seen) holds per-worker exactly as in the serial
+  # model: a crash/timeout mid-sweep at worst re-detects, never swallows.
   while IFS=$'\t' read -r fullname pr; do
     [ -n "${fullname:-}" ] || continue
     owner=${fullname%%/*}
@@ -347,12 +371,30 @@ poll_once() {
     if [ -z "$owner" ] || [ -z "$repo" ] || [ "$owner" = "$fullname" ] || [ -z "${pr:-}" ]; then
       continue
     fi
-    process_pr "$owner" "$repo" "$pr" "$contributor"
     basename=$(seen_file "$owner" "$repo" "$pr"); basename=${basename##*/}
     open_basenames="${open_basenames}${basename} "
+
+    # Throttle: at capacity, wait for one worker to finish before launching the
+    # next. wait -n (bash >= 4.3) blocks until any child exits; the decrement
+    # keeps the running count honest (it can only under-count finished workers,
+    # which is conservative — concurrency never exceeds the cap).
+    while [ "$running" -ge "$max_jobs" ]; do
+      wait -n 2>/dev/null || wait
+      running=$((running - 1))
+    done
+
+    # </dev/null so no worker's gh children can consume this loop's stdin.
+    process_pr "$owner" "$repo" "$pr" "$contributor" </dev/null &
+    running=$((running + 1))
   done <<EOF
 $prs
 EOF
+
+  # Wait for every worker before detect_left_open, so the per-PR seen files are
+  # settled and open_basenames is complete — a live worker must not be writing a
+  # seen file while detect_left_open scans the seen dir.
+  wait
+  running=0
 
   detect_left_open "$open_basenames"
 }
