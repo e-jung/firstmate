@@ -466,6 +466,56 @@ test_all_filters_off_mutes_watcher() {
   pass "all filters off (empty filters=) mutes the watcher instead of resetting to defaults"
 }
 
+test_parallel_poll_is_lossless_and_does_not_cross_contaminate() {
+  # With PRs polled concurrently (bounded by FM_GH_CONCURRENCY), the per-PR
+  # losslessness invariant (print before seen write) and per-PR seen-file
+  # independence must both hold. Seed many PRs across distinct repos so several
+  # parallel waves run, each worker owning its own seen file.
+  local dir out i sf n=12
+  dir=$(make_case parallel)
+
+  local pr_lines=()
+  for i in $(seq 1 "$n"); do
+    pr_lines+=( "$(printf 'org/r%d\t1' "$i")" )
+    printf '5\n' > "$dir/fixture/comments-org-r$i-1"
+  done
+  seed_prs "$dir" "${pr_lines[@]}"
+  run_poll "$dir" >/dev/null   # baseline all n PRs (comments=5 each)
+
+  # Each PR gains a DISTINCT count (PR i -> 5+i) so a worker that crossed wires
+  # would stamp another PR's count into the wrong seen file.
+  for i in $(seq 1 "$n"); do
+    printf '%d\n' "$((5 + i))" > "$dir/fixture/comments-org-r$i-1"
+  done
+
+  # Losslessness under concurrency: make the seen dir read-only so every
+  # worker's seen write fails, then poll with concurrency well below n. Every
+  # PR's event must STILL print this cycle (each worker prints before its seen
+  # write, independent of the other workers).
+  chmod a-w "$dir/state/.github-watch-seen"
+  out=$(FM_GH_CONCURRENCY=4 run_poll "$dir")
+  chmod u+w "$dir/state/.github-watch-seen"
+  for i in $(seq 1 "$n"); do
+    printf '%s\n' "$out" | grep -Fq "COMMENT: org/r$i#1 has $i new comment(s)" \
+      || fail "parallel poll did not emit PR r$i before its seen write; out: $out"
+  done
+
+  # No cross-contamination: after a writable concurrent poll, each PR's seen
+  # file holds its OWN advanced count and its own identity (never another PR's
+  # values), even though workers ran concurrently with a shared .tmp stage.
+  out=$(FM_GH_CONCURRENCY=4 run_poll "$dir")
+  for i in $(seq 1 "$n"); do
+    sf="$dir/state/.github-watch-seen/org-r$i-1"
+    grep -Fxq "comments=$((5 + i))" "$sf" \
+      || fail "r$i seen file has wrong count (cross-contamination?): $(cat "$sf")"
+    grep -Fxq "owner=org" "$sf" || fail "r$i seen file lost owner identity"
+    grep -Fxq "repo=r$i"  "$sf" || fail "r$i seen file has wrong repo (cross-contamination?)"
+    grep -Fxq "pr=1"      "$sf" || fail "r$i seen file lost pr identity"
+  done
+
+  pass "parallel poll emits before each seen write and never cross-contaminates seen files"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -479,3 +529,4 @@ test_ci_detection
 test_merge_filter_suppresses_merge_event
 test_ci_carry_forward_across_empty_window
 test_all_filters_off_mutes_watcher
+test_parallel_poll_is_lossless_and_does_not_cross_contaminate
