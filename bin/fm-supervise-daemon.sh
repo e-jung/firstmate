@@ -552,6 +552,66 @@ pane_input_pending() {  # <target>
   return 0
 }
 
+# --- inject-time liveness filter --------------------------------------------
+# A buffered escalation can outlive the crewmate window it is about: a task may
+# be torn down after its event was buffered but before the batched digest is
+# injected. Delivering such a phantom escalation is obsolete noise (same class as
+# delivering an event twice). The filter runs ONCE per flush (not per poll): for
+# each buffered line it parses the referenced task(s) and drops the line when
+# every referenced target is gone.
+
+# Print task ids referenced by an escalation digest line, one per line:
+#   - signal / catch-all lines carry "<id>.status:" token(s)
+#   - the stale-persisted housekeeping line carries a "<session>:fm-<id>" window
+# A line with no parseable reference prints nothing.
+_escalation_refs() {  # <line>
+  local line=$1 tok win
+  while IFS= read -r tok; do
+    [ -n "$tok" ] && printf '%s\n' "${tok%.status:}"
+  done < <(printf '%s' "$line" | grep -oE '[^[:space:]|]+\.status:' 2>/dev/null || true)
+  while IFS= read -r win; do
+    [ -n "$win" ] && window_to_task "$win"
+  done < <(printf '%s' "$line" | grep -oE '[A-Za-z0-9._-]+:fm-[A-Za-z0-9._-]+' 2>/dev/null || true)
+}
+
+# 0 (live) if the task's meta exists AND its recorded tmux window still resolves.
+_ref_live() {  # <task-id> <state>
+  local task=$1 state=$2 meta win
+  meta="$state/$task.meta"
+  [ -e "$meta" ] || return 1
+  win=$(grep '^window=' "$meta" | head -1 | cut -d= -f2-)
+  [ -n "$win" ] || return 1
+  tmux display-message -p -t "$win" '#{pane_id}' >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# Decide whether a buffered escalation line should be KEPT (return 0) or
+# SUPPRESSED (return 1) at inject time. Suppression requires at least one
+# parseable reference AND every referenced target gone. Lines with no parseable
+# reference are kept (fail-safe: never silently drop an unverifiable escalation).
+# check-kind lines ("<reason>" like "check: <path>: <out>") are suppressed when
+# the referenced *.check.sh no longer exists.
+escalation_line_keep() {  # <line> <state>
+  local line=$1 state=$2 refs ref any=0 live=0 path
+  case "$line" in
+    "check: "*)
+      path=$(printf '%s' "$line" | sed -nE 's/^check: ([^:]*\.check\.sh):.*/\1/p')
+      [ -n "$path" ] || return 0      # malformed check line: fail-safe keep
+      [ -e "$path" ] && return 0      # check script still exists: keep
+      return 1                        # check script gone: suppress
+      ;;
+  esac
+  refs=$(_escalation_refs "$line")
+  [ -n "$refs" ] || return 0          # no reference parsed: fail-safe keep
+  for ref in $refs; do
+    any=1
+    _ref_live "$ref" "$state" && live=1
+  done
+  [ "$any" = "1" ] || return 0
+  [ "$live" = "1" ] && return 0       # at least one referenced window live: keep
+  return 1                            # all referenced windows gone: suppress
+}
+
 escalate_add() {  # <state> <distilled-item>
   local state=$1 item=$2 buf
   buf="$state/.subsuper-escalations"
@@ -563,9 +623,26 @@ escalate_add() {  # <state> <distilled-item>
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf item n msg kept="" suppressed=0
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
+  # Inject-time liveness filter: drop buffered lines whose referenced target
+  # (crewmate window or check script) is gone — torn down after buffering. An
+  # escalation about a dead target is obsolete noise; suppress it and drop it
+  # from the buffer so it is never retried or delivered as a phantom alert.
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    if escalation_line_keep "$item" "$state"; then
+      kept="${kept}${item}"$'\n'
+    else
+      suppressed=1
+      log "inject: suppressed stale escalation (target gone): $item"
+    fi
+  done < "$buf"
+  if [ "$suppressed" = "1" ]; then
+    printf '%s' "$kept" > "$buf"
+    [ -s "$buf" ] || { rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; }
+  fi
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
