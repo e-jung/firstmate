@@ -79,7 +79,22 @@ case "$sub" in
       */commits/*/check-runs)
         sha=${path##*/commits/}; sha=${sha%/check-runs}
         f="$FX/ci-$sha"
-        [ -f "$f" ] && { cat "$f"; exit 0; }
+        [ -f "$f" ] || exit 0
+        # The watcher passes --jq to roll check-runs up into a single overall
+        # state; run that same filter against the JSON fixture so the real
+        # roll-up logic (success/failure/pending/neutral) is exercised, not
+        # just the comparison. Falls back to cat for any caller without --jq.
+        jq_expr=""
+        prev=""
+        for a in "$@"; do
+          if [ "$prev" = "--jq" ]; then jq_expr=$a; fi
+          prev=$a
+        done
+        if [ -n "$jq_expr" ]; then
+          jq -r "$jq_expr" "$f"
+        else
+          cat "$f"
+        fi
         exit 0
         ;;
     esac
@@ -135,6 +150,30 @@ seed_prs() {
   : > "$dir/fixture/prs"
   local ln
   for ln in "$@"; do printf '%s\n' "$ln" >> "$dir/fixture/prs"; done
+}
+
+# seed_ci <dir> <sha> <conclusion...> -> write a JSON check-runs fixture the
+# fake gh feeds through the watcher's real --jq roll-up. Each conclusion arg is
+# a Checks-API value ("success","failure","neutral","skipped","timed_out",...)
+# or the literal "pending" for a still-running check (status in_progress,
+# conclusion null). The fake gh runs the watcher's --jq filter on this JSON, so
+# the actual roll-up logic (not just the comparison) is what the tests exercise.
+seed_ci() {
+  local f="$1/fixture/ci-$2"
+  shift 2
+  printf '%s' '{"check_runs":[' > "$f"
+  local first=1 c status conclusion
+  for c in "$@"; do
+    [ "$first" = 1 ] || printf ',' >> "$f"
+    first=0
+    if [ "$c" = "pending" ]; then
+      status="in_progress"; conclusion="null"
+    else
+      status="completed"; conclusion="\"$c\""
+    fi
+    printf '{"status":"%s","conclusion":%s}' "$status" "$conclusion" >> "$f"
+  done
+  printf '%s' ']}' >> "$f"
 }
 
 test_filter_toggling() {
@@ -377,24 +416,24 @@ test_ci_detection() {
   dir=$(make_case ci)
   seed_prs "$dir" $'kunchenguid/no-mistakes\t310'
   printf 'abcdef1\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
-  printf 'success,success,success\n' > "$dir/fixture/ci-abcdef1"
+  seed_ci "$dir" abcdef1 success success success
   sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-310"
 
   run_poll "$dir" >/dev/null
-  grep -Fxq "ci=success,success,success" "$sf" || fail "baseline ci signature not set"
+  grep -Fxq "ci=success" "$sf" || fail "baseline ci state not rolled up to success"
 
-  # A check goes red: signature changes.
-  printf 'failure,success,success\n' > "$dir/fixture/ci-abcdef1"
+  # One check goes red: the overall state flips success -> failure (one event).
+  seed_ci "$dir" abcdef1 failure success success
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 checks changed" \
-    || fail "ci signature change did not emit event; got: $out"
-  grep -Fxq "ci=failure,success,success" "$sf" || fail "ci signature not advanced"
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 -> failure" \
+    || fail "ci state change did not emit event; got: $out"
+  grep -Fxq "ci=failure" "$sf" || fail "ci state not advanced to failure"
 
   # Steady state again: silence.
   out=$(run_poll "$dir")
   [ -z "$out" ] || fail "steady-state ci poll should be silent; got: $out"
 
-  pass "CI signature change emits CI event"
+  pass "overall CI state change emits a single CI event"
 }
 
 test_merge_filter_suppresses_merge_event() {
@@ -420,29 +459,29 @@ test_ci_carry_forward_across_empty_window() {
   dir=$(make_case ci-carry)
   seed_prs "$dir" $'kunchenguid/no-mistakes\t310'
   printf 'sha1\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
-  printf 'success,success\n' > "$dir/fixture/ci-sha1"
+  seed_ci "$dir" sha1 success success
   sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-310"
 
-  # Baseline: CI passing for sha1.
+  # Baseline: CI passing for sha1 (rolled up to success).
   run_poll "$dir" >/dev/null
-  grep -Fxq "ci=success,success" "$sf" || fail "baseline ci not recorded"
+  grep -Fxq "ci=success" "$sf" || fail "baseline ci state not recorded"
 
-  # New commit: sha changes, check-runs not populated yet (empty ci_sig).
+  # New commit: sha changes, check-runs not populated yet (empty ci_state).
   printf 'sha2\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-310"
   rm -f "$dir/fixture/ci-sha1"
-  # No ci-sha2 fixture yet -> ci_signature returns empty.
+  # No ci-sha2 fixture yet -> ci_state returns empty.
   out=$(run_poll "$dir")
   [ -z "$out" ] || fail "transient empty ci window should be silent; got: $out"
   # seen_ci must be carried forward (not dropped) so a later change still fires.
-  grep -Fxq "ci=success,success" "$sf" || fail "ci signature was dropped during empty window"
+  grep -Fxq "ci=success" "$sf" || fail "ci state was dropped during empty window"
 
-  # CI completes for sha2 and FAILS: signature differs from carried-forward.
-  printf 'failure,success\n' > "$dir/fixture/ci-sha2"
+  # CI completes for sha2 and FAILS: state differs from carried-forward success.
+  seed_ci "$dir" sha2 failure success
   out=$(run_poll "$dir")
-  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 checks changed" \
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#310 -> failure" \
     || fail "ci completion after empty window did not fire; got: $out"
 
-  pass "CI signature carries forward across an empty window and fires on change"
+  pass "overall CI state carries forward across an empty window and fires on change"
 }
 
 test_all_filters_off_mutes_watcher() {
@@ -516,6 +555,116 @@ test_parallel_poll_is_lossless_and_does_not_cross_contaminate() {
   pass "parallel poll emits before each seen write and never cross-contaminates seen files"
 }
 
+test_ci_debounces_staggered_checks() {
+  # Reproduces the no-mistakes#312 chatter: a PR whose many check-runs complete
+  # at staggered times. Under the old per-multiset logic each completion changed
+  # the signature and fired (one event per check). The roll-up keeps the state
+  # at "pending" while ANY check is still running, then flips to green exactly
+  # once when the last one completes.
+  local dir out sf finished i
+  dir=$(make_case ci-debounce)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t312'
+  printf 'sha7\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-312"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-312"
+
+  # Cycle 1: 7 checks, all pending -> baseline (no event, first run).
+  seed_ci "$dir" sha7 pending pending pending pending pending pending pending
+  run_poll "$dir" >/dev/null
+  grep -Fxq "ci=pending" "$sf" || fail "baseline should roll 7 pending checks up to pending"
+
+  # Checks complete a few at a time: state stays pending, so every one of these
+  # cycles must stay silent (under the old logic each would have fired).
+  for finished in 1 3 6; do
+    local args=()
+    for i in $(seq 1 7); do
+      if [ "$i" -le "$finished" ]; then args+=(success); else args+=(pending); fi
+    done
+    seed_ci "$dir" sha7 "${args[@]}"
+    out=$(run_poll "$dir")
+    if printf '%s\n' "$out" | grep -Fq "CI:"; then
+      fail "fired while still pending after $finished/7 checks done; got: $out"
+    fi
+  done
+
+  # Last check completes: pending -> green fires exactly once.
+  seed_ci "$dir" sha7 success success success success success success success
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#312 -> green" \
+    || fail "pending->success transition did not fire once; got: $out"
+  # No second fire on the next (steady) cycle.
+  out=$(run_poll "$dir")
+  if printf '%s\n' "$out" | grep -Fq "CI:"; then
+    fail "steady success re-fired; got: $out"
+  fi
+
+  pass "staggered checks debounce to a single overall-state transition"
+}
+
+test_ci_state_transitions() {
+  # The three transitions the captain cares about, each firing exactly once:
+  # pending->green, green->green (silent), green->failure.
+  local dir out sf
+  dir=$(make_case ci-trans)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t320'
+  printf 'shat\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-320"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-320"
+
+  seed_ci "$dir" shat pending
+  run_poll "$dir" >/dev/null   # baseline pending
+
+  # pending -> green fires once.
+  seed_ci "$dir" shat success
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#320 -> green" \
+    || fail "pending->success did not fire; got: $out"
+  grep -Fxq "ci=success" "$sf" || fail "state not advanced to success"
+
+  # green -> green does not fire.
+  out=$(run_poll "$dir")
+  if printf '%s\n' "$out" | grep -Fq "CI:"; then fail "success->success re-fired; got: $out"; fi
+
+  # green -> failure fires once.
+  seed_ci "$dir" shat success failure
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#320 -> failure" \
+    || fail "success->failure did not fire; got: $out"
+  grep -Fxq "ci=failure" "$sf" || fail "state not advanced to failure"
+
+  pass "pending->green fires once, green->green is silent, green->failure fires once"
+}
+
+test_ci_rollup_precedence() {
+  # The rolled-up state follows GitHub's combined-status precedence: a red check
+  # settles failure even while others are still pending; neutral checks are
+  # ignored entirely (never red, never green, never block).
+  local dir out sf
+  dir=$(make_case ci-rollup)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t321'
+  printf 'shar\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-321"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-321"
+
+  # Baseline: a passing check plus a neutral informational check rolls up to
+  # success (neutral ignored).
+  seed_ci "$dir" shar success neutral
+  run_poll "$dir" >/dev/null
+  grep -Fxq "ci=success" "$sf" || fail "success+neutral should roll up to success"
+
+  # A failure landing while another check is still pending settles failure
+  # immediately (no transient pending event).
+  seed_ci "$dir" shar success failure pending
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#321 -> failure" \
+    || fail "failure+pending should roll straight up to failure; got: $out"
+  grep -Fxq "ci=failure" "$sf" || fail "state not advanced to failure"
+
+  # The pending check then succeeds: state stays failure (no second fire).
+  seed_ci "$dir" shar success failure success
+  out=$(run_poll "$dir")
+  if printf '%s\n' "$out" | grep -Fq "CI:"; then fail "failure->failure re-fired; got: $out"; fi
+
+  pass "roll-up precedence: failure beats pending, neutral checks are ignored"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -528,5 +677,8 @@ test_review_detection
 test_ci_detection
 test_merge_filter_suppresses_merge_event
 test_ci_carry_forward_across_empty_window
+test_ci_debounces_staggered_checks
+test_ci_state_transitions
+test_ci_rollup_precedence
 test_all_filters_off_mutes_watcher
 test_parallel_poll_is_lossless_and_does_not_cross_contaminate
