@@ -30,9 +30,12 @@
 # Config: state/.github-watch-config (key=value lines).
 # Seen:   state/.github-watch-seen/<owner>-<repo>-<pr> (key=value lines).
 #
-# The ci filter reads the Checks API (check-runs); CI providers that report
-# only via the legacy commit status API (some older Travis/Coveralls setups)
-# are not covered. Use `gh pr checks` directly for a unified view.
+# The ci filter rolls the Checks API (check-runs) up to a single overall state
+# per PR (green/failure/pending) and fires one event only when that state flips,
+# not once per check landing — so a PR whose many checks trickle in reports a
+# single transition, not a burst. CI providers that report only via the legacy
+# commit status API (some older Travis/Coveralls setups) are not covered; use
+# `gh pr checks` directly for a unified view.
 # Comment, review, and check-run counts fetch up to 100 items per type per PR
 # (per_page=100, no pagination); a single PR with >100 of one kind would cap.
 #
@@ -217,11 +220,35 @@ head_sha() {
   ghc pr view "$3" -R "$1/$2" --json headRefOid -q .headRefOid
 }
 
-# ci_signature <owner> <repo> <sha> -> sorted multiset of check conclusions/statuses
-ci_signature() {
+# ci_state <owner> <repo> <sha> -> the commit's rolled-up overall CI state:
+#   success  every non-neutral check passed (conclusion success/skipped), none still running
+#   failure  at least one non-neutral check failed (failure/timed_out/cancelled/action_required/stale)
+#   pending  at least one non-neutral check is still queued/in_progress (no conclusion yet)
+#   neutral  only neutral check-runs are present
+#   (empty)  no check-runs reported yet; the caller carries forward the prior state
+# Rolled up from the Checks API so a PR with many staggered checks surfaces a
+# single green/red transition instead of one event per check landing. Failure
+# beats pending (a red check already settles the PR's outcome), matching
+# GitHub's own combined-status precedence.
+ci_state() {
   [ -n "$3" ] || return 0
+  # shellcheck disable=SC2016  # single quotes are deliberate: $all/$rel are jq bindings, not shell vars.
   ghc api "repos/$1/$2/commits/$3/check-runs?per_page=100" \
-    --jq '[.check_runs[] | (.conclusion // .status)] | sort | join(",")'
+    --jq '(.check_runs // []) as $all
+          | ($all | map(select(.conclusion != "neutral"))) as $rel
+          | if   ($all | length) == 0 then ""
+            elif ($rel | length) == 0 then "neutral"
+            elif any($rel[]; .conclusion != null and .conclusion != "success" and .conclusion != "skipped") then "failure"
+            elif any($rel[]; .conclusion == null) then "pending"
+            else "success" end'
+}
+
+# ci_label <state> -> the word printed in a CI event line (success -> green).
+ci_label() {
+  case "${1:-}" in
+    success) printf 'green' ;;
+    *) printf '%s' "${1:-unknown}" ;;
+  esac
 }
 
 # ---- the poll ----
@@ -246,14 +273,15 @@ atomic_write() {
   fi
 }
 
-# build_seen <prior-seen-file> <owner> <repo> <pr> <c_count> <r_count> <ci_sig> <sha> <p_state>
+# build_seen <prior-seen-file> <owner> <repo> <pr> <c_count> <r_count> <ci_state> <sha> <p_state>
 # Compose the seen-state block: high-water marks for counts, current value for
 # ci/state. Fields with no fresh value this cycle are carried forward from the
 # prior block, so toggling a filter off never wipes its remembered high-water.
-# CI is carried forward across a transiently-empty fetch (a new commit whose
-# check-runs have not populated yet) so a later status change still fires.
+# CI is the rolled-up overall state; it is carried forward across a transiently
+# empty fetch (a new commit whose check-runs have not populated yet) so a later
+# state transition still fires.
 build_seen() {
-  local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_sig=$7 sha=$8 p_state=$9
+  local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_st=$7 sha=$8 p_state=$9
   local seen_c seen_r seen_ci seen_state new_c new_r ci_val state_val block
   seen_c=$(seen_get "$sf" comments)
   seen_r=$(seen_get "$sf" reviews)
@@ -266,7 +294,7 @@ build_seen() {
   if is_int "$r_count"; then
     if is_int "$seen_r"; then new_r=$((seen_r > r_count ? seen_r : r_count)); else new_r=$r_count; fi
   fi
-  ci_val=$ci_sig
+  ci_val=$ci_st
   [ -n "$ci_val" ] || ci_val=$seen_ci
   state_val=$p_state
   [ -n "$state_val" ] || state_val=$seen_state
@@ -289,17 +317,17 @@ build_seen() {
 # own seen file, so concurrent workers never contend on seen state.
 process_pr() {
   local owner=$1 repo=$2 pr=$3 contributor=$4
-  local sf c_count r_count p_state sha ci_sig
+  local sf c_count r_count p_state sha ci_st
   local initialized seen_c seen_r seen_state seen_ci ev=""
   sf=$(seen_file "$owner" "$repo" "$pr")
 
-  c_count="" r_count="" p_state="" sha="" ci_sig=""
+  c_count="" r_count="" p_state="" sha="" ci_st=""
   filter_enabled comments && c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor")
   filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr" "$contributor")
   filter_enabled merge    && p_state=$(pr_state "$owner" "$repo" "$pr")
   if filter_enabled ci; then
     sha=$(head_sha "$owner" "$repo" "$pr")
-    ci_sig=$(ci_signature "$owner" "$repo" "$sha")
+    ci_st=$(ci_state "$owner" "$repo" "$sha")
   fi
 
   initialized=$(seen_get "$sf" initialized)
@@ -319,9 +347,11 @@ process_pr() {
       ev="${ev}REVIEW: ${owner}/${repo}#${pr} has $((r_count - seen_r)) new review(s)
 "
     fi
-    # ci: event on any signature change.
-    if [ -n "$ci_sig" ] && [ -n "$seen_ci" ] && [ "$seen_ci" != "$ci_sig" ]; then
-      ev="${ev}CI: ${owner}/${repo}#${pr} checks changed
+    # ci: event on overall-state transition only (debounced). A PR with many
+    # staggered checks surfaces one event per green/red/pending flip, not one
+    # per check landing. No event while the rolled-up state is unchanged.
+    if [ -n "$ci_st" ] && [ -n "$seen_ci" ] && [ "$seen_ci" != "$ci_st" ]; then
+      ev="${ev}CI: ${owner}/${repo}#${pr} -> $(ci_label "$ci_st")
 "
     fi
     # merge: event on open -> merged/closed transition.
@@ -341,7 +371,7 @@ process_pr() {
   # delivered and the marker stale -> a redundant re-detect, never a swallow.
   [ -n "$ev" ] && printf '%s' "$ev"
   local block
-  block=$(build_seen "$sf" "$owner" "$repo" "$pr" "$c_count" "$r_count" "$ci_sig" "$sha" "$p_state")
+  block=$(build_seen "$sf" "$owner" "$repo" "$pr" "$c_count" "$r_count" "$ci_st" "$sha" "$p_state")
   atomic_write "$sf" "$block"
 }
 
