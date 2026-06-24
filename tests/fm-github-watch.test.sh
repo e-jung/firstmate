@@ -48,6 +48,14 @@ case "$sub" in
     exit 0
     ;;
   api)
+    # Injectable transient API error: when $FX/api-error exists, emit a GitHub
+    # error body to stdout and exit non-zero — exactly how real gh behaves on a
+    # 401/5xx (the --jq template is bypassed on error responses). This is the
+    # bug surface: the raw error JSON reached stdout and was parsed as CI data.
+    if [ -f "$FX/api-error" ]; then
+      printf '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}\n'
+      exit 1
+    fi
     # gh api <path> --jq ... : find the repos/... path argument.
     path=""
     for a in "$@"; do
@@ -766,6 +774,43 @@ test_ci_ignore_excludes_known_gap_check() {
   pass "known fork-routing gap check excluded from roll-up; real failures still surface"
 }
 
+test_api_error_skips_pr_without_event() {
+  # Reproduces the bug: a transient 401 makes `gh api` write the error body
+  # {"message":"Bad credentials",...} to stdout (bypassing --jq). The old ghc()
+  # swallowed stderr + the exit code, so the watcher parsed that JSON as CI state
+  # and fired a bogus "CI: ... -> { \"message\": ... }" event. The fix detects the
+  # API error (non-zero exit OR an error-body shape) and skips the PR for the
+  # cycle: no event, no crash, seen left untouched so the next (recovered) cycle
+  # still fires the real transition (lossless).
+  local dir out sf
+  dir=$(make_case api-error)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t500'
+  printf 'sha500\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-500"
+  seed_ci "$dir" sha500 success
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-500"
+
+  # Baseline: CI green.
+  run_poll "$dir" >/dev/null
+  grep -Fxq "ci=success" "$sf" || fail "baseline ci not recorded as success"
+
+  # Inject a transient 401 on every `gh api` call this cycle.
+  : > "$dir/fixture/api-error"
+  out=$(run_poll "$dir" 2>/dev/null)
+  [ -z "$out" ] || fail "transient API error must not surface as an event; got: $out"
+  # seen must be untouched (ci still the prior success, not the error JSON).
+  grep -Fxq "ci=success" "$sf" \
+    || fail "seen state was clobbered during API error: $(cat "$sf")"
+
+  # Recover: remove the blip and flip CI to failure. The real transition fires.
+  rm -f "$dir/fixture/api-error"
+  seed_ci "$dir" sha500 failure
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#500 -> failure" \
+    || fail "post-blip real transition did not fire; got: $out"
+
+  pass "transient GitHub API error skips the PR without emitting an event"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -785,3 +830,4 @@ test_all_filters_off_mutes_watcher
 test_parallel_poll_is_lossless_and_does_not_cross_contaminate
 test_silent_baseline_on_schema_migration
 test_ci_ignore_excludes_known_gap_check
+test_api_error_skips_pr_without_event

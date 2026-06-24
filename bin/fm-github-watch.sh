@@ -90,9 +90,36 @@ valid_filter() {
   case "$1" in comments|ci|reviews|merge) return 0 ;; *) return 1 ;; esac
 }
 
-# Run gh, swallowing errors and stderr so a missing gh or a transient API
-# failure never kills the poll (output is simply empty for that call).
-ghc() { command gh "$@" 2>/dev/null || true; }
+# A GitHub REST API error body is a JSON object carrying top-level "message" and
+# "documentation_url" (e.g. {"message":"Bad credentials","documentation_url":"...","status":"401"}).
+# On a transient API failure (401, 5xx, rate limit) gh writes that body to stdout
+# — bypassing any --jq template — and exits non-zero. Every successful probe
+# output is a scalar/number/TSV, never this shape, so the pair is a safe signal.
+is_gh_error() {
+  case "$1" in
+    *'"message"'*)
+      case "$1" in *'"documentation_url"'*) return 0 ;; esac
+      ;;
+  esac
+  return 1
+}
+
+# Run gh, capturing its stdout. Returns non-zero if gh exited non-zero OR its
+# output is a GitHub API error body; in either case the body is suppressed so a
+# caller that ignores the exit status can never parse an error response as data
+# (the bug: a 401 body reached stdout and was parsed as CI state, firing a bogus
+# "CI: ... -> { \"message\": ... }" event). Probe callers treat a non-zero return
+# as "skip this PR this cycle" so a transient blip never surfaces as an event.
+# stderr is always swallowed so a missing gh or a transient failure never spams
+# the watcher's own capture pipe.
+ghc() {
+  local out rc
+  out=$(command gh "$@" 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] || is_gh_error "$out"; then
+    return 1
+  fi
+  printf '%s' "$out"
+}
 
 # cfg_read <key> -> prints value (empty if missing/unset)
 cfg_read() {
@@ -128,7 +155,7 @@ get_contributor() {
   v=$(cfg_read contributor)
   if [ -n "$v" ]; then printf '%s' "$v"; return; fi
   if [ -n "${FM_GH_CONTRIBUTOR:-}" ]; then printf '%s' "$FM_GH_CONTRIBUTOR"; return; fi
-  ghc api user -q .login 2>/dev/null | tr -d '\n'
+  ghc api user -q .login | tr -d '\n' || true
 }
 
 get_filters() {
@@ -354,13 +381,23 @@ process_pr() {
   local initialized seen_c seen_r seen_state seen_ci ev=""
   sf=$(seen_file "$owner" "$repo" "$pr")
 
+  local api_err=0
   c_count="" r_count="" p_state="" sha="" ci_st=""
-  filter_enabled comments && c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor")
-  filter_enabled reviews  && r_count=$(count_reviews "$owner" "$repo" "$pr" "$contributor")
-  filter_enabled merge    && p_state=$(pr_state "$owner" "$repo" "$pr")
+  if filter_enabled comments; then c_count=$(count_comments "$owner" "$repo" "$pr" "$contributor") || api_err=1; fi
+  if filter_enabled reviews;  then r_count=$(count_reviews  "$owner" "$repo" "$pr" "$contributor") || api_err=1; fi
+  if filter_enabled merge;    then p_state=$(pr_state "$owner" "$repo" "$pr") || api_err=1; fi
   if filter_enabled ci; then
-    sha=$(head_sha "$owner" "$repo" "$pr")
-    ci_st=$(ci_state "$owner" "$repo" "$sha")
+    sha=$(head_sha "$owner" "$repo" "$pr") || api_err=1
+    if [ -n "$sha" ]; then ci_st=$(ci_state "$owner" "$repo" "$sha") || api_err=1; fi
+  fi
+  # If any enabled probe hit a GitHub API error this cycle, skip the whole PR:
+  # emit nothing and do not advance seen, so a transient blip can never surface
+  # as an event (e.g. an error JSON parsed as CI data). The next cycle
+  # re-evaluates from the same baseline — lossless, never a permanent swallow.
+  if [ "$api_err" -ne 0 ]; then
+    printf 'fm-github-watch: skipping %s/%s#%s this cycle (GitHub API error)\n' \
+      "$owner" "$repo" "$pr" >&2
+    return 0
   fi
 
   initialized=$(seen_get "$sf" initialized)
@@ -421,7 +458,12 @@ poll_once() {
   max_jobs=$(get_concurrency)
   running=0
   contributor=$(get_contributor)
-  prs=$(discover_prs)
+  # If discovery itself failed (transient API blip), abort the cycle: an empty
+  # result would otherwise make detect_left_open think every open PR merged.
+  prs=$(discover_prs) || {
+    printf 'fm-github-watch: PR discovery failed this cycle; skipping\n' >&2
+    return 0
+  }
 
   # Parallel per-PR polling. Each worker is a subshell running process_pr; each
   # owns its own seen file (seen_file is keyed by owner/repo/pr), so concurrent
@@ -499,7 +541,7 @@ detect_left_open() {
     repo=$(seen_get "$f" repo)
     pr=$(seen_get "$f" pr)
     if [ -z "$owner" ] || [ -z "$repo" ] || [ -z "$pr" ]; then continue; fi
-    p_state=$(pr_state "$owner" "$repo" "$pr")
+    p_state=$(pr_state "$owner" "$repo" "$pr") || continue
     [ -n "$p_state" ] || continue   # transient gh failure: leave seen state untouched
     # Migration: a prior seen file whose schema does not match the current
     # version is silently re-baselined — stamp the current schema + observed
