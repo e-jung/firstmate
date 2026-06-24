@@ -176,6 +176,27 @@ seed_ci() {
   printf '%s' ']}' >> "$f"
 }
 
+# seed_ci_named <dir> <sha> <name=conclusion>...
+# Like seed_ci but each check-run carries a name, so name-based ignore filters
+# (FM_GH_IGNORE_CHECKS) can be exercised through the real --jq roll-up. The
+# literal "pending" still means a running check (conclusion null). A name is
+# embedded as a JSON string literal (backslash and double-quote escaped).
+seed_ci_named() {
+  local f="$1/fixture/ci-$2"
+  shift 2
+  printf '%s' '{"check_runs":[' > "$f"
+  local first=1 arg name c status conclusion esc
+  for arg in "$@"; do
+    name=${arg%%=*}; c=${arg#*=}
+    [ "$first" = 1 ] || printf ',' >> "$f"
+    first=0
+    if [ "$c" = "pending" ]; then status="in_progress"; conclusion="null"; else status="completed"; conclusion="\"$c\""; fi
+    esc=${name//\\/\\\\}; esc=${esc//\"/\\\"}
+    printf '{"status":"%s","conclusion":%s,"name":"%s"}' "$status" "$conclusion" "$esc" >> "$f"
+  done
+  printf '%s' ']}' >> "$f"
+}
+
 test_filter_toggling() {
   local dir
   dir=$(make_case filter-toggle)
@@ -665,6 +686,86 @@ test_ci_rollup_precedence() {
   pass "roll-up precedence: failure beats pending, neutral checks are ignored"
 }
 
+test_silent_baseline_on_schema_migration() {
+  # Reproduces the debounce deploy flood: a seen file written by an OLDER
+  # watcher version (here, an old per-multiset ci signature, no schema= field).
+  # Without the schema guard, the first poll under the new code sees
+  # seen_ci="success:success:failure" != ci_st="success" and fires a spurious
+  # CI transition for EVERY migrated PR at once. The guard treats a schema
+  # mismatch as a silent re-baseline: write the new schema + correct values,
+  # emit nothing. A subsequent REAL transition still fires.
+  local dir out sf
+  dir=$(make_case ci-migrate)
+  seed_prs "$dir" $'kunchenguid/no-mistakes\t330'
+  printf 'sham\n' > "$dir/fixture/sha-kunchenguid-no-mistakes-330"
+  printf 'OPEN\n' > "$dir/fixture/state-kunchenguid-no-mistakes-330"
+  sf="$dir/state/.github-watch-seen/kunchenguid-no-mistakes-330"
+  mkdir -p "$(dirname "$sf")"
+
+  # An old-format seen file: initialized but no schema=, and a stale ci value
+  # that the new roll-up would read as "different" from the fresh success.
+  cat > "$sf" <<'OLD'
+owner=kunchenguid
+repo=no-mistakes
+pr=330
+initialized=1
+ci=success:success:failure
+state=OPEN
+OLD
+
+  # Fresh roll-up is plain success; under the old code this != the stale sig.
+  seed_ci "$dir" sham success success success
+
+  # First poll after migration: SILENT (no flood), seen rewritten to new schema.
+  out=$(run_poll "$dir")
+  [ -z "$out" ] || fail "schema migration should baseline silently; got: $out"
+  grep -Fxq "schema=2" "$sf" || fail "seen file not stamped with current schema"
+  grep -Fxq "ci=success" "$sf" || fail "ci not re-baselined to the rolled-up success"
+
+  # A subsequent REAL transition still fires (migration only silenced once).
+  seed_ci "$dir" sham success failure success
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/no-mistakes#330 -> failure" \
+    || fail "post-migration real transition did not fire; got: $out"
+
+  pass "schema mismatch is silently re-baselined; real transitions still fire"
+}
+
+test_ci_ignore_excludes_known_gap_check() {
+  # A kunchenguid fork-PR whose ONLY failing check is the known fork-routing
+  # signature gap (#293: "PR must be raised via no-mistakes") must roll up to
+  # green when its real checks pass, not a false failure. The default
+  # FM_GH_IGNORE_CHECKS regex drops that name from the roll-up. A REAL failure
+  # (different name) must still roll up to failure, so the filter is not just
+  # disabling failure detection.
+  local dir out sf
+  dir=$(make_case ci-ignore)
+  seed_prs "$dir" $'kunchenguid/firstmate\t38'
+  printf 'sha38\n' > "$dir/fixture/sha-kunchenguid-firstmate-38"
+  sf="$dir/state/.github-watch-seen/kunchenguid-firstmate-38"
+
+  # 3 real checks pass; the gap check fails by name. run_poll uses the default
+  # FM_GH_IGNORE_CHECKS, so the gap name is excluded -> rolls up to success.
+  seed_ci_named "$dir" sha38 \
+    "build=success" "test=success" "lint=success" \
+    "PR must be raised via no-mistakes=failure"
+
+  run_poll "$dir" >/dev/null   # baseline: gap excluded -> success, not failure
+  grep -Fxq "ci=success" "$sf" \
+    || fail "gap-excluded PR should roll up to success, got: $(cat "$sf")"
+
+  # A REAL check failing (different name) must still surface failure despite the
+  # gap check also failing: the ignore list is not a blanket failure suppressor.
+  seed_ci_named "$dir" sha38 \
+    "build=success" "test=failure" "lint=success" \
+    "PR must be raised via no-mistakes=failure"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CI: kunchenguid/firstmate#38 -> failure" \
+    || fail "real check failure should still roll up to failure; got: $out"
+
+  pass "known fork-routing gap check excluded from roll-up; real failures still surface"
+}
+
 test_filter_toggling
 test_first_run_baselines_silently
 test_comment_detection_advances_seen_after_print
@@ -682,3 +783,5 @@ test_ci_state_transitions
 test_ci_rollup_precedence
 test_all_filters_off_mutes_watcher
 test_parallel_poll_is_lossless_and_does_not_cross_contaminate
+test_silent_baseline_on_schema_migration
+test_ci_ignore_excludes_known_gap_check

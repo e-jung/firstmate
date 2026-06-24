@@ -46,7 +46,7 @@
 # swallow. A failing seen write leaves the old marker in place, so the same
 # event fires again next cycle. PRs are polled concurrently but each worker
 # owns its own per-PR seen file, so this ordering holds per-worker exactly.
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -64,6 +64,21 @@ CLOSE_REPROBE_SECS="${FM_GH_CLOSE_REPROBE_SECS:-7200}"
 # the captain's ~22 PRs is well under the 5000/hr ceiling even at 12 sweeps/hr.
 # Set FM_GH_CONCURRENCY to tune (>=1; 0/non-numeric falls back to the default 8).
 DEFAULT_CONCURRENCY=8
+# Seen-state schema version. Bump when a stored field's meaning or the field set
+# changes in a way that would make a prior value miscompare (e.g. the ci roll-up
+# changed `ci` from a multiset signature to a single state). On a schema mismatch
+# the first poll silently re-baselines: it writes the new seen state and emits no
+# event, so deploying a schema change never floods once as every PR appears to
+# "transition" off the old format. Only subsequent real transitions fire.
+SEEN_SCHEMA=2
+# Regex (Oniguruma) of check-run NAMES to drop from the CI roll-up before it is
+# computed. Default: the known fork-routing signature gap #293 ("PR must be
+# raised via no-mistakes"), which fails on kunchenguid fork-PRs even though the
+# PR's real checks pass. With it excluded such PRs roll up to green when their
+# real checks pass, instead of a false failure. Set FM_GH_IGNORE_CHECKS to a
+# custom regex, or to empty to disable filtering entirely. Only the CI roll-up
+# applies this; the raw check list and the other filters are unchanged.
+IGNORE_CHECKS="${FM_GH_IGNORE_CHECKS-PR must be raised via no-mistakes}"
 
 mkdir -p "$STATE" "$SEEN_DIR"
 
@@ -229,18 +244,36 @@ head_sha() {
 # Rolled up from the Checks API so a PR with many staggered checks surfaces a
 # single green/red transition instead of one event per check landing. Failure
 # beats pending (a red check already settles the PR's outcome), matching
-# GitHub's own combined-status precedence.
+# GitHub's own combined-status precedence. Check-runs whose NAME matches the
+# IGNORE_CHECKS regex (default: the known fork-routing gap #293) are dropped
+# before the roll-up, so a PR that fails ONLY that signature check still rolls
+# up to green when its real checks pass. The regex is embedded into the jq
+# program (escaped for a JSON string literal) because `gh api` has no --arg
+# binding for its --jq filter; a malformed regex fails open to empty (carried
+# forward), never crashing the poll.
 ci_state() {
   [ -n "$3" ] || return 0
-  # shellcheck disable=SC2016  # single quotes are deliberate: $all/$rel are jq bindings, not shell vars.
-  ghc api "repos/$1/$2/commits/$3/check-runs?per_page=100" \
-    --jq '(.check_runs // []) as $all
-          | ($all | map(select(.conclusion != "neutral"))) as $rel
-          | if   ($all | length) == 0 then ""
-            elif ($rel | length) == 0 then "neutral"
-            elif any($rel[]; .conclusion != null and .conclusion != "success" and .conclusion != "skipped") then "failure"
-            elif any($rel[]; .conclusion == null) then "pending"
-            else "success" end'
+  local ignore_escaped jq_filter
+  ignore_escaped=${IGNORE_CHECKS//\\/\\\\}
+  ignore_escaped=${ignore_escaped//\"/\\\"}
+  # The regex is embedded into the jq program (escaped for a JSON string
+  # literal) because `gh api` has no --arg binding for its --jq filter. Every jq
+  # binding ($ignore/$raw/$all/$rel) is backslash-escaped so the heredoc leaves
+  # it literal; only $ignore_escaped expands.
+  # shellcheck disable=SC2016
+  jq_filter=$(cat <<JQ
+"$ignore_escaped" as \$ignore
+| (.check_runs // []) as \$raw
+| (if \$ignore == "" then \$raw else [\$raw[] | select(((.name // "") | test(\$ignore)) | not)] end) as \$all
+| (\$all | map(select(.conclusion != "neutral"))) as \$rel
+| if   (\$all | length) == 0 then ""
+  elif (\$rel | length) == 0 then "neutral"
+  elif any(\$rel[]; .conclusion != null and .conclusion != "success" and .conclusion != "skipped") then "failure"
+  elif any(\$rel[]; .conclusion == null) then "pending"
+  else "success" end
+JQ
+)
+  ghc api "repos/$1/$2/commits/$3/check-runs?per_page=100" --jq "$jq_filter"
 }
 
 # ci_label <state> -> the word printed in a CI event line (success -> green).
@@ -298,7 +331,7 @@ build_seen() {
   [ -n "$ci_val" ] || ci_val=$seen_ci
   state_val=$p_state
   [ -n "$state_val" ] || state_val=$seen_state
-  block=$(printf 'owner=%s\nrepo=%s\npr=%s\ninitialized=1' "$owner" "$repo" "$pr")
+  block=$(printf 'owner=%s\nrepo=%s\npr=%s\nschema=%s\ninitialized=1' "$owner" "$repo" "$pr" "$SEEN_SCHEMA")
   is_int "$new_c"     && block=$(printf '%s\ncomments=%s' "$block" "$new_c")
   is_int "$new_r"     && block=$(printf '%s\nreviews=%s'  "$block" "$new_r")
   [ -n "$ci_val" ]    && block=$(printf '%s\nci=%s'       "$block" "$ci_val")
@@ -331,7 +364,12 @@ process_pr() {
   fi
 
   initialized=$(seen_get "$sf" initialized)
-  if [ -n "$initialized" ]; then
+  # A prior seen file whose schema does not match the current version is treated
+  # as a first-run baseline: emit nothing this cycle (so deploying a schema
+  # change never floods as every PR appears to "transition" off the old format)
+  # and let build_seen rewrite it at the current schema with carried-forward
+  # values. Only subsequent real transitions fire.
+  if [ -n "$initialized" ] && [ "$(seen_get "$sf" schema)" = "$SEEN_SCHEMA" ]; then
     seen_c=$(seen_get "$sf" comments)
     seen_r=$(seen_get "$sf" reviews)
     seen_state=$(seen_get "$sf" state)
@@ -463,6 +501,17 @@ detect_left_open() {
     if [ -z "$owner" ] || [ -z "$repo" ] || [ -z "$pr" ]; then continue; fi
     p_state=$(pr_state "$owner" "$repo" "$pr")
     [ -n "$p_state" ] || continue   # transient gh failure: leave seen state untouched
+    # Migration: a prior seen file whose schema does not match the current
+    # version is silently re-baselined — stamp the current schema + observed
+    # state, emit nothing — so a schema change never floods as every PR appears
+    # to "transition" off the old format. All other fields (closed_at, counts,
+    # ci) are preserved; only schema/state are re-stamped.
+    if [ "$(seen_get "$f" schema)" != "$SEEN_SCHEMA" ]; then
+      block=$(awk -F= -v sch="$SEEN_SCHEMA" -v s="$p_state" \
+        '$1 != "schema" && $1 != "state" { print } END { print "schema=" sch; print "state=" s }' "$f")
+      atomic_write "$f" "$block"
+      continue
+    fi
     [ "$p_state" = "$seen_state" ] && continue   # unchanged: no event, no rewrite
     case "$p_state" in
       MERGED|CLOSED)
