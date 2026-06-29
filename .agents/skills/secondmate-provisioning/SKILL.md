@@ -119,3 +119,5 @@ If `treehouse return` fails for a leased home, teardown stops with state intact 
 With `--force`, teardown is the explicit discard path.
 It kills child windows, discards child work and state inside the secondmate home, removes the route, releases the lease, and removes the retired secondmate home.
 Never use `--force` unless the captain explicitly said to discard the work.
+That captain word is enforced structurally, not just by discipline: `--force` takes effect only when a captain-authorization token exists at `state/<id>.force-granted`, which firstmate creates solely after the captain says to discard that task's work, consumes on every invocation, and audits to `state/.force-audit.log`.
+Without the token, `--force` is inert - the in-flight-work refusal holds and firstmate can never self-authorize the discard (prime directive #3).
