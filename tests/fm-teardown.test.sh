@@ -22,7 +22,7 @@
 #   (c) local-only + merged into local main, no remote         -> ALLOW  (no regression)
 #   (d) no-mistakes + HEAD on origin remote-tracking branch    -> ALLOW  (no regression)
 #   (e) no-mistakes + unpushed, no PR, content not in default  -> REFUSE (safety)
-#   (f) local-only + truly unpushed + --force                  -> ALLOW  (escape hatch)
+#   (f) local-only + truly unpushed + --force (authorized)     -> ALLOW  (escape hatch)
 #   (g) no-mistakes + squash-merged PR, exact PR head          -> ALLOW  (squash fix)
 #   (h) no-mistakes + no PR but content already in default     -> ALLOW  (content fallback)
 #   (i) no-mistakes + dirty worktree, even when work landed     -> REFUSE (dirty wins)
@@ -34,6 +34,9 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (r) --force without a captain-auth token                    -> INERT  (force guard: PD#3)
+#   (s) --force token is consumed on use                        -> gone   (force guard: PD#3)
+#   (t) --force audit log records every invocation              -> logged (force guard: PD#3)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -132,6 +135,15 @@ write_meta() {
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode"
+}
+
+# Record the captain-authorization token that lets --force take effect. The
+# token is the two-step model's separation of "captain authorized" from
+# "firstmate decided": firstmate writes it ONLY after the captain's explicit OK.
+# Args: case_dir
+grant_force() {
+  local case_dir=$1
+  touch "$case_dir/state/task-x1.force-granted"
 }
 
 # Commit something on the worktree's task branch. Args: case_dir [message]
@@ -660,15 +672,104 @@ test_local_only_force_overrides_unpushed() {
   case_dir=$(make_case force-override)
   write_meta "$case_dir" local-only ship
   wt_commit "$case_dir" "unpushed work"
+  # --force now requires the captain-authorization token; grant it for the
+  # authorized escape hatch.
+  grant_force "$case_dir"
 
   set +e
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "force-override: --force should bypass the unpushed-work check"
-  ! grep -q REFUSED "$case_dir/stderr" || fail "force-override: REFUSED printed despite --force"
-  pass "local-only worktree with unpushed work is torn down under --force (escape hatch)"
+  expect_code 0 "$rc" "force-override: authorized --force should bypass the unpushed-work check"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "force-override: REFUSED printed despite authorized --force"
+  pass "local-only worktree with unpushed work is torn down under captain-authorized --force (escape hatch)"
+}
+
+# Without the captain-authorization token, --force is INERT: FORCE is cleared and
+# the normal safety checks run, so genuinely unlanded work is still refused. This
+# is the core guard - firstmate cannot self-authorize a force-discard.
+test_force_without_token_is_inert() {
+  local case_dir rc
+  case_dir=$(make_case force-inert)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+  # No grant_force: --force must NOT take effect.
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "force-inert: --force without a token should fall back to the safety check and refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "force-inert: no REFUSED line (normal safety check did not run)"
+  grep -q "not captain-authorized" "$case_dir/stderr" \
+    || fail "force-inert: no not-authorized warning in stderr"
+  pass "--force without a captain-authorization token is inert (safety check refuses)"
+}
+
+# The token is consumed on use: after a force-teardown it must be gone, so a
+# second --force needs a fresh captain OK. Verified for both an authorized run
+# (token removed on success) and an inert run (rm -f is a harmless no-op).
+test_force_consumes_token() {
+  local case_dir rc
+  case_dir=$(make_case force-consume)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+  grant_force "$case_dir"
+
+  [ -f "$case_dir/state/task-x1.force-granted" ] \
+    || fail "force-consume: precondition - grant_force did not create the token"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "force-consume: authorized --force should succeed"
+  [ ! -f "$case_dir/state/task-x1.force-granted" ] \
+    || fail "force-consume: the authorization token was not consumed after teardown"
+  pass "captain-authorization token is consumed after an authorized --force"
+}
+
+# Every --force invocation (authorized or not) is recorded in
+# state/.force-audit.log with timestamp, task id, caller pid, and the
+# authorization verdict.
+test_force_audit_log() {
+  local case_dir rc
+  case_dir=$(make_case force-audit)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+
+  # First invocation: no token -> authorized=no, inert.
+  set +e
+  run_teardown "$case_dir" --force > /dev/null 2> "$case_dir/stderr-inert"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "force-audit: inert run should refuse via the safety check"
+
+  # Second invocation: grant the token -> authorized=yes, effective.
+  grant_force "$case_dir"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr-auth"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "force-audit: authorized run should succeed"
+
+  local audit="$case_dir/state/.force-audit.log"
+  [ -f "$audit" ] || fail "force-audit: no audit log at $audit"
+  local lines
+  lines=$(grep -c "^.* task=task-x1 " "$audit" || true)
+  expect_code 2 "$lines" "force-audit: audit log should have one entry per --force invocation"
+  grep -q "task=task-x1 .* authorized=no" "$audit" \
+    || fail "force-audit: missing authorized=no entry for the inert invocation"
+  grep -q "task=task-x1 .* authorized=yes" "$audit" \
+    || fail "force-audit: missing authorized=yes entry for the authorized invocation"
+  grep -Eq "task=task-x1 caller_pid=[0-9]+ pid=[0-9]+" "$audit" \
+    || fail "force-audit: audit entry is missing pid fields"
+  grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z " "$audit" \
+    || fail "force-audit: audit entry is missing an ISO-8601 UTC timestamp"
+  pass "every --force invocation is audited with timestamp, task id, pids, and authorization"
 }
 
 test_local_only_fork_remote_allows
@@ -679,6 +780,9 @@ test_local_only_merged_to_local_main_allows
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
+test_force_without_token_is_inert
+test_force_consumes_token
+test_force_audit_log
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

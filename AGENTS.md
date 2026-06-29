@@ -32,6 +32,10 @@ Hard rules, in priority order:
    The one standing, captain-authorized relaxation is a project's `yolo` flag (section 7): with `yolo` on, firstmate makes routine approval decisions itself, but anything destructive, irreversible, or security-sensitive still escalates to the captain.
 3. **Never tear down a worktree that holds unlanded work.**
    `bin/fm-teardown.sh` enforces this; never bypass it with `--force` unless the captain explicitly said to discard the work.
+   That captain word is enforced structurally, not just by discipline: `--force` takes effect only when a captain-authorization token exists at `state/<id>.force-granted`.
+   Create that token (`touch state/<id>.force-granted`) ONLY after the captain explicitly says to discard that task's work, then run `bin/fm-teardown.sh <id> --force`.
+   Without the token, `--force` is inert - it falls back to the normal safety check - and firstmate can never self-authorize the discard.
+   The token is consumed on use, so each force-teardown needs a fresh captain OK, and every `--force` invocation is logged to `state/.force-audit.log`.
    The work is "landed" once `HEAD` is reachable from any remote-tracking branch (a fork counts as a remote - upstream-contribution PRs pushed to a fork satisfy this in any mode); for a normal ship task whose commits are not so reachable, it is also landed when its PR is merged and GitHub reports a PR head that contains the current local work (including a local `HEAD` that is an ancestor of the PR head, or unpushed local patches that were replayed into that PR head) or when its content is already present in the up-to-date default branch; for `local-only` ship tasks with no remote at all, the work may instead be merged into the local default branch.
    The PR consulted for that check comes from the task's recorded `pr=` when present, or - when no `pr=` was ever recorded, e.g. a yolo-authorized merge on a repo with no PR CI where the usual "checks green" `fm-pr-check.sh` trigger never fires - from a merged PR discovered by matching the worktree's own branch name, so a missing `pr=` never by itself false-refuses landed work. Use `bin/fm-pr-merge.sh <id> <PR url>` for every merge (captain-requested or yolo) so `pr=` and any available `pr_head=` are recorded as part of the merge itself rather than relying on that discovery fallback.
    Uncommitted changes are never landed.
@@ -91,6 +95,8 @@ state/               volatile runtime signals; gitignored
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects= (fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request= and x_request_ts= for an X-mention-originated task, section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
+  <id>.force-granted captain-authorization token for fm-teardown --force (prime directive #3); created only after the captain explicitly OKs discarding that task's work; consumed on use
+  .force-audit.log   append-only audit of every --force invocation (timestamp, task id, caller pid, authorization verdict)
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -545,6 +551,7 @@ Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or mai
 Load `secondmate-provisioning` before retiring it.
 The safety check is the secondmate's own home: teardown refuses while its `state/*.meta` contains in-flight work.
 With `--force`, teardown is the explicit discard path for child windows, child work, state, route, lease, and home; never use it unless the captain explicitly said to discard the work.
+`--force` requires the captain-authorization token `state/<id>.force-granted` (prime directive #3): without it, `--force` is inert and the in-flight-work refusal holds.
 
 ### Scout tasks (report instead of PR)
 

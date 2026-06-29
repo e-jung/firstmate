@@ -38,6 +38,14 @@
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
 #   when the captain has explicitly said to discard the work.
+#   Two-step model (prime directive #3: firstmate never self-authorizes --force):
+#     1. The captain explicitly OKs discarding THIS task's work.
+#     2. firstmate records that authorization as state/<task-id>.force-granted.
+#     3. firstmate runs `fm-teardown.sh <task-id> --force`.
+#   --force requires that token: without it, --force is INERT (the token is
+#   missing, FORCE is cleared, and the normal safety checks run). The token is
+#   consumed on every --force invocation (authorized or not, success or refuse),
+#   and every --force invocation is logged to state/.force-audit.log.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +61,36 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 FORCE=${2:-}
+
+# --- Captain authorization for --force (prime directive #3) -----------------
+# `--force` bypasses teardown's work-not-landed, dirty, scout-report, and
+# secondmate-child safety checks, so it can discard work the captain has not
+# reviewed. firstmate must NEVER self-authorize it. This guard separates the
+# decision ("firstmate decided to pass --force") from the authorization ("the
+# captain explicitly OK'd discarding THIS task"): --force takes effect ONLY when
+# a captain-authorization token exists at state/<id>.force-granted, which
+# firstmate creates solely after the captain says to discard that task's work.
+# Without the token, --force is INERT (FORCE is cleared and the normal safety
+# checks run). The token is consumed on EVERY --force invocation - authorized or
+# not, and whether teardown later completes or refuses - so a stale token can
+# never carry over and each force-teardown needs a fresh captain OK. Every
+# --force invocation is logged to state/.force-audit.log.
+FORCE_GRANTED="$STATE/$ID.force-granted"
+if [ "$FORCE" = "--force" ]; then
+  FORCE_AUTHORIZED=no
+  [ -f "$FORCE_GRANTED" ] && FORCE_AUTHORIZED=yes
+  printf '%s task=%s caller_pid=%s pid=%s authorized=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ID" "$PPID" "$$" "$FORCE_AUTHORIZED" \
+    >> "$STATE/.force-audit.log"
+  # Consume the token up front so a re-invocation needs a fresh captain OK even
+  # if this teardown later refuses or aborts (fail-closed).
+  rm -f "$FORCE_GRANTED"
+  if [ "$FORCE_AUTHORIZED" != yes ]; then
+    echo "WARNING: --force on $ID is not captain-authorized (no $FORCE_GRANTED token)." >&2
+    echo "firstmate cannot self-authorize --force; falling back to normal safety checks." >&2
+    FORCE=
+  fi
+fi
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
