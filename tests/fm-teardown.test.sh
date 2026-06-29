@@ -37,6 +37,7 @@
 #   (r) --force without a captain-auth token                    -> INERT  (force guard: PD#3)
 #   (s) --force token is consumed on use                        -> gone   (force guard: PD#3)
 #   (t) --force audit log records every invocation              -> logged (force guard: PD#3)
+#   (u) stale force token removed by normal teardown            -> gone   (force guard: PD#3)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -772,6 +773,33 @@ test_force_audit_log() {
   pass "every --force invocation is audited with timestamp, task id, pids, and authorization"
 }
 
+# A stale force-granted token (e.g. firstmate recorded captain authorization but
+# then ran a NORMAL teardown without --force) must not survive teardown: the
+# final state cleanup removes it along with the task's other volatile state, so a
+# stale authorization can never linger or be reused.
+test_normal_teardown_cleans_stale_force_token() {
+  local case_dir rc wt_head
+  case_dir=$(make_case stale-token)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "landed work"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/project" update-ref refs/heads/main "$wt_head"
+  touch "$case_dir/state/task-x1.force-granted"
+
+  [ -f "$case_dir/state/task-x1.force-granted" ] \
+    || fail "stale-token: precondition - token not created"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "stale-token: normal teardown of landed work should succeed"
+  [ ! -f "$case_dir/state/task-x1.force-granted" ] \
+    || fail "stale-token: a stale force-granted token survived normal teardown"
+  pass "normal teardown cleans up a stale force-granted token"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -783,6 +811,7 @@ test_local_only_force_overrides_unpushed
 test_force_without_token_is_inert
 test_force_consumes_token
 test_force_audit_log
+test_normal_teardown_cleans_stale_force_token
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
