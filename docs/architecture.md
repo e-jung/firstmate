@@ -78,6 +78,7 @@ Bare `fm-send.sh fm-<id>` requests to a live `kind=secondmate` are prefixed with
 Explicit `session:window` sends and direct human typing stay unmarked, so captain intervention in a secondmate pane remains conversational.
 After seeding a secondmate, `fm-backlog-handoff.sh` moves already-judged in-scope queued items from the main backlog into that secondmate home so the domain queue starts in the right place.
 Idle secondmate panes are healthy; teardown is explicit and refuses while the secondmate home has in-flight work unless the captain has approved discard with `--force`.
+The discard path is guarded structurally, not just by discipline: `--force` takes effect only when a captain-authorization token exists at `state/<id>.force-granted`, which firstmate creates solely after the captain says to discard that task's work, consumes on every invocation, and audits to `state/.force-audit.log`; without the token, `--force` is inert and the normal safety checks run (prime directive #3: firstmate never self-authorizes a discard).
 
 Secondmate homes stay on the same firstmate version as the primary checkout.
 On main firstmate bootstrap, `fm-bootstrap.sh` fast-forwards each live secondmate home recorded in `state/*.meta` to the primary default-branch commit with no origin fetch.
