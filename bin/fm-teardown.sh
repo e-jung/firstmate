@@ -205,7 +205,7 @@ pr_is_merged() {
 # "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
 # so the caller refuses rather than guesses.
 content_in_default() {
-  local name ref default_tree merged_tree
+  local name ref default_tree merged_tree base merge_out
   name=$(default_branch) || return 1
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
     git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
@@ -217,9 +217,21 @@ content_in_default() {
   fi
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
-  [ "$merged_tree" = "$default_tree" ]
+  # Modern git (>= 2.38) writes the merged tree object on stdout; the merged tree
+  # equals the default branch's tree exactly when the change already landed.
+  if merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null); then
+    merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+    [ "$merged_tree" = "$default_tree" ]
+    return $?
+  fi
+  # Older git (< 2.38) lacks --write-tree; fall back to the legacy 3-way form
+  # `git merge-tree <base> <branch1> <branch2>`, which prints only entries that
+  # differ from <branch1> (the default branch). An empty result therefore means
+  # merging HEAD into the default branch is a no-op - the change landed - while a
+  # net change or a conflict prints something, so the fail-safe (refuse) holds.
+  base=$(git -C "$WT" merge-base "$ref" HEAD 2>/dev/null) || return 1
+  merge_out=$(git -C "$WT" merge-tree "$base" "$ref" HEAD 2>/dev/null) || return 1
+  [ -z "$merge_out" ]
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
