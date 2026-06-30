@@ -68,6 +68,9 @@ WINDOWS="$(tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null 
 offenders=""
 for meta in "$STATE"/*.meta; do
   [ -e "$meta" ] || continue
+  kind="$(grep -m1 '^kind=' "$meta" 2>/dev/null | cut -d= -f2-)"
+  [ -n "$kind" ] || kind=ship
+  [ "$kind" = secondmate ] && continue
   id="$(basename "$meta" .meta)"
   status_file="$STATE/$id.status"
   [ -f "$status_file" ] || continue        # no status reported yet -> still working
