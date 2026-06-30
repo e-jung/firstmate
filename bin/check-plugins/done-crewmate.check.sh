@@ -27,11 +27,20 @@ set -u
 fm_root() {
   [ -n "${FM_ROOT_OVERRIDE:-}" ] && { printf '%s\n' "$FM_ROOT_OVERRIDE"; return; }
   if [ -d state ] && [ -d bin ]; then printf '%s\n' "$PWD"; return; fi
-  local src="${BASH_SOURCE[0]}" real d
-  real="$(readlink -f "$src" 2>/dev/null)" && [ -n "$real" ] && src="$real"
-  d="$(cd "$(dirname "$src")" 2>/dev/null && pwd)" || { printf '%s\n' "$PWD"; return; }
-  if [ -d "$d/../.." ]; then (cd "$d/../.." && pwd); return; fi   # bin/check-plugins -> root
-  if [ -d "$d/.." ];    then (cd "$d/.." && pwd);    return; fi   # direct state/ invocation
+  local src="${BASH_SOURCE[0]}" real d root
+  # readlink -f is GNU-only; plain readlink (one symlink level) is portable on
+  # BSD/GNU. fm-plugin.sh points state/<name>.check.sh at an absolute
+  # bin/check-plugins/<name>.check.sh; resolve a relative target against the link.
+  if real="$(readlink "$src" 2>/dev/null)" && [ -n "$real" ]; then
+    case "$real" in
+      /*) src="$real" ;;
+      *)  src="$(cd -P "$(dirname "$src")" && pwd)/$real" ;;
+    esac
+  fi
+  d="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)" || { printf '%s\n' "$PWD"; return; }
+  for root in "$d/../.." "$d/.."; do
+    [ -d "$root/bin" ] && [ -d "$root/state" ] && { (cd -P "$root" && pwd); return; }
+  done
   printf '%s\n' "$PWD"
 }
 FM_ROOT="$(fm_root)"
