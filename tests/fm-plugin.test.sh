@@ -315,6 +315,7 @@ test_bootstrap_invokes_plugin_sync() {
   local boot="$ROOT/bin/fm-bootstrap.sh"
   grep -F 'fm-plugin.sh' "$boot" >/dev/null \
     || fail "bootstrap does not reference fm-plugin.sh"
+  # shellcheck disable=SC2016  # single quotes are deliberate: literal source string
   grep -F '[ -x "$FM_ROOT/bin/fm-plugin.sh" ] && "$FM_ROOT/bin/fm-plugin.sh" sync' "$boot" >/dev/null \
     || fail "bootstrap does not invoke the sync subcommand with the documented guard"
   pass "bootstrap invokes 'fm-plugin.sh sync' (guarded, best-effort) as its final step"
