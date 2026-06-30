@@ -142,6 +142,15 @@ In dry-run, `fm-x-dismiss.sh` records `{request_id, endpoint:"dismiss"}` to the 
 The live answer and follow-up bodies intentionally stay the same shape, including optional `image`; the relay distinguishes them by endpoint, and dismiss stays `{request_id}`.
 These paths need `jq` to build the JSON payload, but they run before token and network checks, so they need neither `FMX_PAIRING_TOKEN` nor `curl`.
 
+## GitHub events watcher (fm-github-watch.sh)
+
+`bin/fm-github-watch.sh` is an optional GitHub events watcher you wire in as a check script (`ln -s ../bin/fm-github-watch.sh state/github-events.check.sh`) so the existing watcher sweep surfaces new comments, rolled-up CI state flips, reviews, and merge/close transitions for the fleet's open PRs.
+Run `fm-github-watch.sh --daemon` for a self-looping poller, `--once` for a single poll, or use the `filter`/`contributor`/`status` subcommands.
+Filter names are `comments`, `ci`, `reviews`, `merge`; the CI filter rolls the Checks API up to a single overall state per PR and fires one event only when that state flips.
+Configuration lives in the local `state/.github-watch-config` (key=value lines) and per-PR seen state in `state/.github-watch-seen/`, both gitignored.
+The contributor is resolved by precedence: the configured value, then `FM_GH_CONTRIBUTOR`, then the authenticated `gh` user; there is no hardcoded default, so a shared tool polls whoever is logged in.
+Comment, review, and check-run counts fetch up to 100 items of each kind per PR, so a single PR with more than 100 of one kind would cap.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -199,4 +208,10 @@ FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash th
 FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
+# GitHub events watcher (bin/fm-github-watch.sh); config also via state/.github-watch-config
+FM_GH_CONTRIBUTOR=                 # contributor login to poll; config value wins, else authenticated gh user; no default
+FM_GH_POLL_SECS=300                # daemon poll interval between sweeps
+FM_GH_CLOSE_REPROBE_SECS=7200      # seconds after a PR closes to keep re-probing for a close->reopen->merge
+FM_GH_CONCURRENCY=8                # max PRs polled concurrently per sweep; non-numeric/0 falls back to the default
+FM_GH_IGNORE_CHECKS='PR must be raised via no-mistakes'   # regex of check-run names dropped from the CI roll-up; empty disables filtering
 ```

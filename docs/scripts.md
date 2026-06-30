@@ -35,6 +35,8 @@ Each file also starts with a short header comment.
 | `fm-peek.sh`             | Print a bounded tail of a crewmate pane                                                                             |
 | `fm-pr-check.sh`         | Record `pr=` and GitHub's `pr_head=` when available for a PR-ready task, then arm the watcher's merge poll          |
 | `fm-pr-merge.sh`         | Require a full GitHub PR URL, record `pr=` and available `pr_head=` via `fm-pr-check.sh`, parse it into `gh-axi pr merge <n> --repo <owner>/<repo>`, default to `--squash` unless a merge method is forwarded, and reject malformed URLs or repo overrides |
+| `fm-plugin.sh`           | Manage durable watcher check plugins: track each canonical source under `bin/check-plugins/`, symlink it into `state/<name>.check.sh` so the watcher sweeps it, with `add`/`remove`/`list`/`sync` subcommands (bootstrap calls `sync` so plugins survive a fresh clone) |
+| `fm-github-watch.sh`     | GitHub events watcher for the fleet's open PRs: run as a check script to surface new comments, rolled-up CI state flips, reviews, and merge/close transitions as one-line events, with `--once`/`--daemon` modes and `filter`/`contributor`/`status` subcommands |
 | `fm-promote.sh`          | Promote a scout task in place so it becomes a protected ship task                                                   |
 | `fm-teardown.sh`         | Return a clean, landed ship worktree or retire/release a secondmate home; requires scout reports, checks child work, removes firstmate-owned hook artifacts, and prints the backend-aware backlog reminder |
 | `fm-harness.sh`          | Detect the running harness; resolve the effective crewmate (`crew`) or secondmate-launch (`secondmate`) harness     |
@@ -45,3 +47,11 @@ Each file also starts with a short header comment.
 | `fm-x-dismiss.sh`        | Dismiss or dry-run preview a skipped X mention without replying by sending `{request_id}` to the relay's `connector/dismiss` endpoint |
 | `fm-x-link.sh`           | Link a spawned task to its originating X mention by recording `x_request=` and `x_request_ts=` in `state/<id>.meta` |
 | `fm-x-followup.sh`       | Detect, post, and clear the single completion follow-up for an X-linked task, forwarding optional `--image <path>`, enforcing the local 24h window, and retrying only when the relay post fails |
+
+## Durable check plugins (`bin/check-plugins/`)
+
+The watcher discovers check scripts via a `state/*.check.sh` glob, but `state/` is gitignored, so a fleet-wide plugin must survive a fresh clone.
+Each plugin's canonical source lives tracked under `bin/check-plugins/<name>.check.sh` and is symlinked into `state/<name>.check.sh` at runtime (managed by `fm-plugin.sh`, restored by bootstrap's `sync`).
+A plugin obeys the same contract as a per-task check: print one line to wake firstmate, print nothing to keep sleeping.
+
+- `done-crewmate.check.sh` - deterministic recurring backstop that wakes firstmate whenever a terminal-status (`done`/`failed`/`blocked`) crewmate's tmux window is still alive, so finished work is never left idle instead of being progressed or torn down.
