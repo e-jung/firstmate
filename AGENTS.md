@@ -72,6 +72,7 @@ README.md            public overview and development notes
 .agents/skills/      shared skills, committed
 .claude/skills       symlink to .agents/skills for claude compatibility
 bin/                 helper scripts, committed; read each script's header before first use
+  check-plugins/    durable watcher check plugins, committed; bin/fm-plugin.sh symlinks each into state/*.check.sh so the watcher picks them up
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited: the primary pushes this into every secondmate home's config/ (section 4), so a secondmate's own crewmates use the primary's value
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
@@ -91,7 +92,7 @@ state/               volatile runtime signals; gitignored
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects= (fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request= and x_request_ts= for an X-mention-originated task, section 14)
-  <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
+  <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check); fleet-wide plugin checks also appear here as symlinks into bin/check-plugins/ (bin/fm-plugin.sh manages them)
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -640,6 +641,13 @@ For `kind=secondmate`, an idle pane is healthy.
 A secondmate may be sitting on its own watcher with no visible pane changes, so parent supervision uses status writes plus heartbeat review, not pane-staleness.
 `fm-watch.sh` therefore skips stale-pane wakes for windows whose meta records `kind=secondmate`.
 This exception is narrow: ordinary crewmates still trip stale detection when their pane stops changing without a busy signature.
+
+**Terminal-status crewmates must be progressed immediately.**
+A crewmate that reports `done`, `failed`, or `blocked` and is then left idle in its tmux window is unfinished supervision work, not a quiet fleet.
+The signal layer fires exactly once, on the status write; if you drop the thread after that, nothing re-nudges you - the stale-pane detector flags the idle pane, but that alarm is indistinguishable from a stuck crewmate until you re-read the status, so a busy supervisor dismisses it as noise.
+The `done-crewmate` check plugin is the deterministic, recurring backstop: it scans every `state/*.meta` for a crewmate whose current status is terminal and whose window is still alive in tmux, and prints one wake line per check interval listing every offender until each is progressed (validated, merged, or torn down).
+It is installed by `bin/fm-plugin.sh add done-crewmate state/done-crewmate.check.sh` and lives durably under `bin/check-plugins/` (symlinked into `state/` so the watcher's existing `*.check.sh` glob picks it up, no watcher changes required; `fm-plugin.sh sync`, called by bootstrap, restores the symlinks after a fresh clone).
+Treat its wake with the same priority as a `signal:`: read the named task's status, then advance or tear it down.
 
 **Watcher liveness is guarded, not just disciplined.**
 Arming the watcher is the last action of every wake-handling turn - but the protocol no longer relies on remembering that.
