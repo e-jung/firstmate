@@ -209,8 +209,9 @@ merged_tree_3way() {
   local ref=$1 head=$2 base tmpidx tree=
   base=$(git -C "$WT" merge-base "$ref" "$head" 2>/dev/null) || return 1
   tmpidx="${TMPDIR:-/tmp}/fm-mergedtree.$$"
-  GIT_INDEX_FILE="$tmpidx" git -C "$WT" read-tree -m --aggressive "$base" "$ref" "$head" 2>/dev/null \
-    && tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WT" write-tree 2>/dev/null) || true
+  if GIT_INDEX_FILE="$tmpidx" git -C "$WT" read-tree -m --aggressive "$base" "$ref" "$head" 2>/dev/null; then
+    tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WT" write-tree 2>/dev/null) || true
+  fi
   rm -f "$tmpidx"
   [ -n "$tree" ] || return 1
   printf '%s' "$tree"

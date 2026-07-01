@@ -352,6 +352,7 @@ fi
 TMP_DIFF=
 # shellcheck disable=SC2329  # cleanup is invoked via the EXIT trap below
 cleanup() {
+  # shellcheck disable=SC2317  # invoked via the EXIT trap below
   [ -z "$TMP_DIFF" ] || rm -f "$TMP_DIFF"
 }
 trap cleanup EXIT
