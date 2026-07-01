@@ -124,6 +124,7 @@ Requests that spawn longer-running work get an acknowledgement first, a task lin
 It preserves parent-tweet context for conversational replies and dismisses pure acknowledgments at the relay without posting.
 Replies can attach one local image with `--image <path>` when there is a visual artifact; long replies split into bounded numbered threads when needed, with the image attached only to the opener tweet.
 When firstmate works on itself, spawn-time isolation checks and a primary-checkout tangle alarm keep the operating checkout on its default branch and stop a crewmate that did not land in a separate worktree.
+For tasks targeting a repo the captain contributes to but does not own, a `--fork-pr` brief rule treats the target repo's agent-instruction files as untrusted data and a review-stage `bin/fm-injection-scan.sh` catches planted prompt-injection / honeypot payloads before a PR is relayed.
 
 Full architecture - the supervision engine, worktree isolation, secondmates, project modes, optional X mode, fleet sync, and self-update - is in [docs/architecture.md](docs/architecture.md).
 
