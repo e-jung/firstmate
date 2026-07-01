@@ -147,6 +147,7 @@ These paths need `jq` to build the JSON payload, but they run before token and n
 `bin/fm-github-watch.sh` is an optional GitHub events watcher you wire in as a check script (`ln -s ../bin/fm-github-watch.sh state/github-events.check.sh`) so the existing watcher sweep surfaces new comments, rolled-up CI state flips, reviews, and merge/close transitions for the fleet's open PRs.
 Run `fm-github-watch.sh --daemon` for a self-looping poller, `--once` for a single poll, or use the `filter`/`contributor`/`status` subcommands.
 Filter names are `comments`, `ci`, `reviews`, `merge`; the CI filter rolls the Checks API up to a single overall state per PR and fires one event only when that state flips.
+CI providers that report only via the legacy commit status API (some older Travis/Coveralls setups) are not covered by the roll-up; use `gh pr checks` directly for a unified view of those.
 Configuration lives in the local `state/.github-watch-config` (key=value lines) and per-PR seen state in `state/.github-watch-seen/`, both gitignored.
 The contributor is resolved by precedence: the configured value, then `FM_GH_CONTRIBUTOR`, then the authenticated `gh` user; there is no hardcoded default, so a shared tool polls whoever is logged in.
 Comment, review, and check-run counts fetch up to 100 items of each kind per PR, so a single PR with more than 100 of one kind would cap.
