@@ -415,5 +415,6 @@ fleet_sync
 # Re-arm durable watcher check plugins (state/*.check.sh symlinks into the
 # tracked canonical copies under bin/check-plugins/). state/ is gitignored, so a
 # fresh clone has no symlinks until this runs. Best-effort and silent on success.
+# shellcheck disable=SC2015  # best-effort: a missing exe or sync failure must never abort bootstrap
 [ -x "$FM_ROOT/bin/fm-plugin.sh" ] && "$FM_ROOT/bin/fm-plugin.sh" sync || true
 exit 0
