@@ -209,7 +209,7 @@ FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher c
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 # GitHub events watcher (bin/fm-github-watch.sh); config also via state/.github-watch-config
-FM_GH_CONTRIBUTOR=                 # contributor login to poll; config value wins, else authenticated gh user; no default
+FM_GH_CONTRIBUTOR=                 # contributor login to poll; config value wins, else this env value, else authenticated gh user; no default
 FM_GH_POLL_SECS=300                # daemon poll interval between sweeps
 FM_GH_CLOSE_REPROBE_SECS=7200      # seconds after a PR closes to keep re-probing for a close->reopen->merge
 FM_GH_CONCURRENCY=8                # max PRs polled concurrently per sweep; non-numeric/0 falls back to the default

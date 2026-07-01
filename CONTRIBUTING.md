@@ -86,6 +86,7 @@ tests/fm-teardown.test.sh                 # fm-teardown.sh landed-work safety an
 tests/fm-pr-merge.test.sh                 # fm-pr-merge.sh records pr= and available pr_head= before merging, parses PR URLs into gh-axi number/--repo calls, defaults to squash, preserves explicit merge methods, rejects malformed URLs and repo overrides, and propagates real merge failures
 tests/fm-crew-state.test.sh               # fm-crew-state.sh current-state reconciliation: run-step authority including closed panes, stale needs-decision/blocked superseded by a resumed run, genuine-parked, cross-branch attribution, pane/status-log fallback, scout skip, torn-down/missing-meta graceful
 tests/fm-github-watch.test.sh             # fm-github-watch.sh events, filters, rolled-up CI flips, merge/close transitions, contributor resolution, seen-state losslessness, and concurrency via a fake gh fixture
+tests/fm-plugin.test.sh                   # fm-plugin.sh add/remove/list/sync lifecycle, invalid-name and not-found guards, and the done-crewmate.check.sh terminal-status offender scan via a fake tmux fixture
 [ "$(readlink CLAUDE.md)" = "AGENTS.md" ]
 [ "$(readlink .claude/skills)" = "../.agents/skills" ]
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
