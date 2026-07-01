@@ -342,7 +342,7 @@ atomic_write() {
 # state transition still fires.
 build_seen() {
   local sf=$1 owner=$2 repo=$3 pr=$4 c_count=$5 r_count=$6 ci_st=$7 sha=$8 p_state=$9
-  local seen_c seen_r seen_ci seen_state new_c new_r ci_val state_val block
+  local seen_c seen_r seen_ci seen_state new_c new_r ci_val state_val block closed_at_val
   seen_c=$(seen_get "$sf" comments)
   seen_r=$(seen_get "$sf" reviews)
   seen_ci=$(seen_get "$sf" ci)
@@ -364,6 +364,12 @@ build_seen() {
   [ -n "$ci_val" ]    && block=$(printf '%s\nci=%s'       "$block" "$ci_val")
   [ -n "$sha" ]       && block=$(printf '%s\nsha=%s'      "$block" "$sha")
   [ -n "$state_val" ] && block=$(printf '%s\nstate=%s'    "$block" "$state_val")
+  closed_at_val=""
+  if [ "$state_val" = "CLOSED" ]; then
+    closed_at_val=$(seen_get "$sf" closed_at)
+    [ -n "$closed_at_val" ] || closed_at_val=$(date +%s)
+  fi
+  [ -n "$closed_at_val" ] && block=$(printf '%s\nclosed_at=%s' "$block" "$closed_at_val")
   printf '%s' "$block"
 }
 

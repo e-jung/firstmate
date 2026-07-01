@@ -397,6 +397,45 @@ test_closed_pr_reprobe_window_is_bounded() {
   pass "closed PR past the re-probe window stops consuming an API call"
 }
 
+test_closed_via_open_search_stamps_closed_at() {
+  # The process_pr close path: a PR that closes while STILL listed in the laggy
+  # open-search index (not emptied first, unlike the detect_left_open test
+  # above). process_pr observes OPEN->CLOSED, emits CLOSED, and build_seen must
+  # stamp closed_at so the later detect_left_open skip guard can age it out.
+  # Without closed_at the skip guard never fires and every cycle re-probes the
+  # settled PR with a gh pr view call, unbounded.
+  local dir out sf
+  dir=$(make_case close-via-open)
+  seed_prs "$dir" $'kunchenguid/firstmate\t42'
+  printf 'OPEN\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  sf="$dir/state/.github-watch-seen/kunchenguid-firstmate-42"
+  run_poll "$dir" >/dev/null                       # baseline OPEN
+  grep -Fxq "state=OPEN" "$sf" || fail "baseline state not OPEN"
+
+  # PR closes but is STILL in the open-search index: process_pr (not
+  # detect_left_open) observes the transition and must stamp closed_at.
+  printf 'CLOSED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(run_poll "$dir")
+  printf '%s\n' "$out" | grep -Fq "CLOSED: kunchenguid/firstmate#42" \
+    || fail "open->closed via open-search did not emit; got: $out"
+  grep -Fxq "state=CLOSED" "$sf" || fail "state not advanced to CLOSED"
+  grep -Fq "closed_at=" "$sf" \
+    || fail "process_pr close path did not stamp closed_at: $(cat "$sf")"
+
+  # PR leaves the open index. With closed_at now set, a zero re-probe window
+  # ages it out immediately, so a later merge is NOT re-detected and costs no
+  # gh pr view call. Without the fix closed_at stayed empty and the merge WAS
+  # re-detected every cycle (the unbounded cost).
+  : > "$dir/fixture/prs"
+  printf 'MERGED\n' > "$dir/fixture/state-kunchenguid-firstmate-42"
+  out=$(PATH="$dir/fakebin:$PATH" GH_FIXTURE="$dir/fixture" FM_GH_CONTRIBUTOR=e-jung \
+        FM_GH_CLOSE_REPROBE_SECS=0 FM_STATE_OVERRIDE="$dir/state" bash "$GH_WATCH" --once)
+  if printf '%s\n' "$out" | grep -Fq "MERGED"; then
+    fail "aged-out CLOSED PR (closed via open-search) was re-probed (cost not bounded)"
+  fi
+  pass "close observed via the open-search index stamps closed_at and bounds re-probes"
+}
+
 test_config_roundtrip() {
   local dir
   dir=$(make_case config)
@@ -818,6 +857,7 @@ test_losslessness_redetects_when_seen_write_fails
 test_merge_detection_on_left_open
 test_closed_then_merged_is_not_swallowed
 test_closed_pr_reprobe_window_is_bounded
+test_closed_via_open_search_stamps_closed_at
 test_config_roundtrip
 test_review_detection
 test_ci_detection
