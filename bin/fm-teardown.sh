@@ -197,13 +197,33 @@ pr_is_merged() {
   unpushed_patches_are_in_pr_head "$head"
 }
 
+# Portable 3-way merge tree for git without `merge-tree --write-tree` (< 2.38).
+# Writes the merged tree of <ref> and <head> over their merge-base into a throwaway
+# index via `read-tree --aggressive` and echoes its hash. Returns non-zero on a merge
+# conflict (the index keeps unmerged entries so `write-tree` fails) or any git error,
+# so the caller refuses rather than guesses. For the boolean "merged tree equals the
+# default tree" question this matches `merge-tree --write-tree`: HEAD's content lands
+# only when it changes nothing the default branch lacks, which is exactly the trivial
+# merge `read-tree --aggressive` resolves.
+merged_tree_3way() {
+  local ref=$1 head=$2 base tmpidx tree=
+  base=$(git -C "$WT" merge-base "$ref" "$head" 2>/dev/null) || return 1
+  tmpidx="${TMPDIR:-/tmp}/fm-mergedtree.$$"
+  GIT_INDEX_FILE="$tmpidx" git -C "$WT" read-tree -m --aggressive "$base" "$ref" "$head" 2>/dev/null \
+    && tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WT" write-tree 2>/dev/null) || true
+  rm -f "$tmpidx"
+  [ -n "$tree" ] || return 1
+  printf '%s' "$tree"
+}
+
 # Is the branch's content already present in the up-to-date default branch? Fetches
 # first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
 # the default branch does not already contain (e.g. its change landed via squash) the
 # merged tree equals the default branch's tree. This isolates branch-only changes, so
 # unrelated commits the default branch gained past the merge-base do not count as
 # "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
+# so the caller refuses rather than guesses. Uses `merge-tree --write-tree` (git
+# >= 2.38) and falls back to a portable read-tree merge on older git.
 content_in_default() {
   local name ref default_tree merged_tree
   name=$(default_branch) || return 1
@@ -217,8 +237,12 @@ content_in_default() {
   fi
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+  if git merge-tree -h 2>&1 | grep -q -- '--write-tree'; then
+    merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+    merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+  else
+    merged_tree=$(merged_tree_3way "$ref" HEAD) || return 1
+  fi
   [ "$merged_tree" = "$default_tree" ]
 }
 
