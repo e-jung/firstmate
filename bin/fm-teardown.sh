@@ -235,6 +235,28 @@ pr_is_merged() {
   unpushed_patches_are_in_pr_head "$head"
 }
 
+# Tree object a clean 3-way merge of HEAD into $1 would produce (echoed on
+# stdout); non-zero on conflict or failure so the caller refuses. Prefers
+# `git merge-tree --write-tree` (git >= 2.38, full rename detection); on older
+# git it falls back to the same 3-way merge into a throwaway index, so the
+# content check stays portable without touching the worktree's real index.
+merged_tree_against() {
+  local ref=$1 merged_tree base tmpidx
+  if git -C "$WT" merge-tree --write-tree HEAD HEAD >/dev/null 2>&1; then
+    merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+    printf '%s\n' "$merged_tree" | head -1
+    return 0
+  fi
+  base=$(git -C "$WT" merge-base "$ref" HEAD 2>/dev/null) || base=$ref
+  tmpidx=$(mktemp) || return 1
+  GIT_INDEX_FILE="$tmpidx" git -C "$WT" read-tree --empty 2>/dev/null \
+    && GIT_INDEX_FILE="$tmpidx" git -C "$WT" read-tree -m "$base" "$ref" HEAD 2>/dev/null \
+    && merged_tree=$(GIT_INDEX_FILE="$tmpidx" git -C "$WT" write-tree 2>/dev/null)
+  rm -f "$tmpidx"
+  [ -n "$merged_tree" ] || return 1
+  printf '%s\n' "$merged_tree"
+}
+
 # Is the branch's content already present in the up-to-date default branch? Fetches
 # first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
 # the default branch does not already contain (e.g. its change landed via squash) the
@@ -255,8 +277,7 @@ content_in_default() {
   fi
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+  merged_tree=$(merged_tree_against "$ref") || return 1
   [ "$merged_tree" = "$default_tree" ]
 }
 
