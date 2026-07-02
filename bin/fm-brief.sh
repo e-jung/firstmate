@@ -171,6 +171,8 @@ read -r MODE _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 
+RULE2='2. Stay inside this worktree; modify nothing outside it.'
+
 case "$MODE" in
   direct-PR)
     SETUP2=""
@@ -193,6 +195,7 @@ EOF
     # end-to-end. Other local-only projects have no binary to install, so gate on repo.
     NM_BUILD_CLAUSE=""
     if [ "$REPO" = "no-mistakes" ]; then
+      RULE2='2. Stay inside this worktree; the only writes you may make outside it are the no-mistakes binary install and daemon restart spelled out in the Definition of done below (a local-only branch commit is otherwise unobservable).'
       NM_BUILD_CLAUSE=$(cat <<EOF
 
 If this task modifies no-mistakes source code, committing to your branch is NOT enough on its own. Before reporting done you MUST also:
@@ -257,7 +260,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
+$RULE2
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
