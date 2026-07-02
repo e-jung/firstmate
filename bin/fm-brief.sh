@@ -179,7 +179,8 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+Any task-specific acceptance or completion criteria stated in the Task section above are part of this Definition of done - you are not done when you have merely committed; you are done only when those criteria are met as well.
+When it is implemented and committed (and any task-specific criteria above are satisfied), push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
 )
@@ -187,12 +188,28 @@ EOF
   local-only)
     SETUP2=""
     RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
+    # no-mistakes develops the binary that runs the pipeline itself: a branch commit is
+    # not observable until the rebuilt binary is installed and the fix is verified
+    # end-to-end. Other local-only projects have no binary to install, so gate on repo.
+    NM_BUILD_CLAUSE=""
+    if [ "$REPO" = "no-mistakes" ]; then
+      NM_BUILD_CLAUSE=$(cat <<EOF
+
+If this task modifies no-mistakes source code, committing to your branch is NOT enough on its own. Before reporting done you MUST also:
+- build the binary (\`make build\`),
+- install it to BOTH \`~/.local/bin/no-mistakes\` AND \`~/.no-mistakes/bin/no-mistakes\`,
+- restart the daemon (\`no-mistakes daemon stop && no-mistakes daemon start\`), and
+- verify the fix end-to-end: reproduce the original failure against the freshly installed binary and confirm it is gone.
+EOF
+)
+    fi
     DOD=$(cat <<EOF
 # Definition of done
 This project ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
+Any task-specific acceptance or completion criteria stated in the Task section above are part of this Definition of done - you are not done when you have merely committed; you are done only when those criteria are met as well.$NM_BUILD_CLAUSE
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
-When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
+When it is implemented and committed (and any task-specific criteria above are satisfied), append \`done: ready in branch fm/$ID\` to the status file and stop.
 Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
 EOF
 )
@@ -204,6 +221,7 @@ EOF
     DOD=$(cat <<EOF
 # Definition of done
 The task is complete only when committed on your branch.
+Any task-specific acceptance or completion criteria stated in the Task section above are part of this Definition of done - a green pipeline is necessary but not sufficient; you are done only when those criteria are met as well.
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
