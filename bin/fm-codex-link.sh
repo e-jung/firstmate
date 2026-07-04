@@ -23,7 +23,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-backend.sh"
 
 usage() {
-  sed -n '2,16p' "$0" >&2
+  sed -n '2,12p' "$0" >&2
   exit 2
 }
 
