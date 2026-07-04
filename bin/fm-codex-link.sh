@@ -109,7 +109,9 @@ case "$1" in
     link_for_dir "report" "$(dirname "$report")" "Review report $report. Summarize the conclusion and recommended next action."
     ;;
   project)
-    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
+    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+      usage
+    fi
     link_for_dir "project" "$2" "${3:-}"
     ;;
   *)
