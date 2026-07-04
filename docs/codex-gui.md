@@ -25,7 +25,7 @@ To generate Codex app links for a task or report, run:
 ```sh
 bin/fm-codex-link.sh task <task-id>
 bin/fm-codex-link.sh report <task-id-or-report-path>
-bin/fm-codex-link.sh project <absolute-project-dir>
+bin/fm-codex-link.sh project <absolute-project-dir> [prompt]
 ```
 
 The helper prints canonical `codex://new?path=...` links with query values encoded, plus the raw local path as a fallback.
