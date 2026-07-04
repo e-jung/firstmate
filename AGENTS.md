@@ -160,6 +160,7 @@ The digest's context section already contains `data/projects.md`, the fleet regi
 Treat any harness memory of captain preferences as a recall cache only; `data/captain.md` is the canonical, harness-portable home.
 If the digest reported `data/projects.md` as `ABSENT` or disagreeing with what is actually under `projects/`, rebuild it from the clones (a README skim per project is enough) before taking on work.
 An `ABSENT` `data/captain.md` or `data/secondmates.md` or `data/learnings.md` means exactly what section 2 says it means (template defaults, no registered secondmates, nothing captured yet) - not a problem to fix.
+After reading the context and fleet-state digest, run `bin/fm-todos.sh` and refresh this harness's native todo/task list from its rows: opencode uses `todowrite`, Claude uses `TodoWrite`; if the current harness has no native todo tool, skip silently. This is the only permitted session-start reread of `data/backlog.md`; preserve the script's order and wording exactly.
 
 Do not dispatch any work until the tools that work needs are present and GitHub auth is good.
 Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and `lavish-axi` when a decision or report is complex enough to deserve a rich review surface.
@@ -405,6 +406,7 @@ Then classify readiness:
 
 Keep dependency judgment coarse: same repo plus overlapping area means serialize; everything else runs parallel.
 For `no-mistakes` projects, the pipeline rebase step absorbs mild overlaps; for other modes, have the crewmate rebase before review or merge if needed.
+After any intake decision changes `data/backlog.md`, rerun `bin/fm-todos.sh` and refresh the native todo/task list from its rows.
 
 Write the brief per section 11.
 
@@ -430,6 +432,7 @@ For `kind=secondmate`, it launches in the registered or explicit firstmate home 
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
 After spawning, peek the endpoint to confirm the crewmate is processing the brief and handle any trust dialog with `harness-adapters`.
 For a ship or scout task, add the task to `data/backlog.md` under In flight.
+After adding dispatched work to `data/backlog.md`, rerun `bin/fm-todos.sh` and refresh the native todo/task list from its rows.
 A secondmate spawn adds no backlog row: its identity and scope live in `data/secondmates.md`, its runtime lives in `state/<id>.meta`, and section 10 owns the backlog contract.
 
 ### Supervise
@@ -517,6 +520,7 @@ The script refuses if the worktree holds uncommitted changes or committed work t
 Known benign case: after an external-PR task, a squash merge leaves the branch commits reachable only on the contributor's fork; add the fork as a remote and fetch (`git remote add fork <fork url> && git fetch fork`), then retry - never reach for `--force`.
 A successful PR-based teardown also refreshes that project's clone through `bin/fm-fleet-sync.sh`, best-effort.
 Then update the backlog using the teardown reminder: run `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise move the task to Done in `data/backlog.md` manually with the full `https://...` PR URL or local merge note and date and keep Done to the 10 most recent.
+After any teardown or decision changes `data/backlog.md`, rerun `bin/fm-todos.sh` and refresh the native todo/task list from its rows.
 Re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
 
 ### Secondmate teardown (explicit only)
