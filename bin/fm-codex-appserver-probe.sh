@@ -245,8 +245,7 @@ rl.on("line", (line) => {
       try {
         await send("thread/read", { threadId, includeTurns: true });
         console.log("thread_read_after_create: ok includeTurns=true");
-      } catch (err) {
-        if (!String(err.message || "").includes("includeTurns")) throw err;
+      } catch (_) {
         await send("thread/read", { threadId, includeTurns: false });
         console.log("thread_read_after_create: ok includeTurns=false");
       }
@@ -257,8 +256,12 @@ rl.on("line", (line) => {
           await send("thread/archive", { threadId });
           console.log("archived_created_thread: yes");
         } catch (err) {
-          if (!String(err.message || "").includes("no rollout")) throw err;
-          console.log("archived_created_thread: unavailable-no-rollout");
+          const archiveMsg = String(err.message || "").toLowerCase();
+          if (archiveMsg.includes("rollout")) {
+            console.log("archived_created_thread: unavailable-no-rollout");
+          } else {
+            console.log(`archived_created_thread: unavailable: ${err.message || "unknown error"}`);
+          }
         }
       }
       console.log(`thread_cwd: ${cwd}`);
@@ -348,8 +351,14 @@ if [ -n "$SCHEMA_DIR" ]; then
   mkdir -p "$SCHEMA_DIR"
   schema_args=(app-server generate-json-schema --out "$SCHEMA_DIR")
   [ "$EXPERIMENTAL_SCHEMA" -eq 0 ] || schema_args+=(--experimental)
-  codex "${schema_args[@]}"
-  summarize_schema "$SCHEMA_DIR"
+  schema_rc=0
+  codex "${schema_args[@]}" || schema_rc=$?
+  if [ "$schema_rc" -eq 0 ]; then
+    summarize_schema "$SCHEMA_DIR" || schema_rc=$?
+  fi
+  if [ "$schema_rc" -ne 0 ]; then
+    exit "$schema_rc"
+  fi
 fi
 
 if [ "$LIVE_HANDSHAKE" -eq 1 ]; then
