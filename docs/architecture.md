@@ -33,6 +33,8 @@ For whole-fleet read-only review, `bin/fm-fleet-snapshot.sh --json` emits schema
 `bin/fm-fleet-view.sh` renders that snapshot as Markdown for humans, while `bin/fm-bearings-snapshot.sh` provides the bounded bearings projection, so both views consume one structured contract instead of reparsing raw fleet files.
 The script header owns the exact JSON schema.
 Optional X mode rides the same check path: the locked session-start bootstrap step drops a local `state/x-watch.check.sh` shim only after the user opts in with `FMX_PAIRING_TOKEN`, and non-X homes keep the default watcher behavior.
+The same path carries the GitHub review/CI watcher: `github_watch_setup` drops `state/github-events.check.sh`, which execs `bin/fm-github-watch.sh --once` to surface new comments, changes-requested reviews, and failed CI on the PRs Firstmate is supervising (discovered from authoritative `state/*.meta` `pr=` lines, not a hard-coded list), silent when nothing changed.
+The per-task merge poll written by `bin/fm-pr-check.sh` is unchanged and still owns the merged-PR signal; the two checks are complementary, not competing.
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude and Grok use background-notify cycles, Codex uses bounded foreground checkpoints, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.
