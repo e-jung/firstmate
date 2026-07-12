@@ -22,6 +22,7 @@ Read `docs/codex-app-backend.md` when it exists in this checkout; that document 
 
 If local helper scripts exist for Codex App work, use only helpers explicitly provided by the operator or maintained by Firstmate.
 For helpers outside `bin/`, inspect the source or header before running `--help`.
+The one Firstmate-maintained `bin/` helper is `bin/fm-codex-link.sh`, a read-only printer of `codex://new` deep links for task worktrees, scout reports, and project directories; it is a captain convenience, not a backend (see `docs/codex-app-backend.md`).
 
 ## Preflight
 
