@@ -151,12 +151,15 @@ phase_send() {
 }
 
 phase_handoff() {
-  # The move is delegated to `tasks-axi mv`; skip cleanly when it is absent (the
-  # downstream recovery and teardown phases do not depend on this phase).
+  # The move is delegated to `tasks-axi mv`; skip cleanly when it is absent or
+  # incompatible (lacks multi-ID mv, introduced in 0.2.2) - the downstream
+  # recovery and teardown phases do not depend on this phase.
   if ! command -v tasks-axi >/dev/null 2>&1; then
     echo "skip: tasks-axi not found (backlog handoff delegates to it)"
     return 0
   fi
+  . "$ROOT/bin/fm-tasks-axi-lib.sh"
+  fm_tasks_axi_compatible || { echo "skip: tasks-axi lacks multi-ID mv support (0.2.2+ required)"; return 0; }
   cat > "$HOME_DIR/data/backlog.md" <<'EOF'
 ## In flight
 - [ ] live-task - active work (repo: alpha, since 2026-06-20)
