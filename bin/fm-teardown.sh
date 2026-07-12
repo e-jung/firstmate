@@ -57,17 +57,20 @@
 #      attempts. Retries key off the error text, not whether the lock file still
 #      exists after the failed attempt - a lock that self-clears mid-check still
 #      deserves a retry of the return.
-#   2. Other treehouse return failures still abort immediately and loudly (no retry).
+#   2. Other treehouse return failures still return rc=1 immediately and loudly
+#      (no retry). The ordinary-task caller treats that as warning-only so task
+#      state cleanup still runs; stricter callers may still abort or fall back.
 #   3. If every retry still hits the lock signature and the lock remains, it is removed
 #      and the return tried once more ONLY when the lock is provably stale per
 #      bin/fm-lock-lib.sh's fm_lock_is_provably_stale, passing the worktree dir as the
 #      companion directory and FM_STALE_WORKTREE_LOCK_AGE_SECS (default 30s) as the age
 #      threshold. That shared proof owns the exact lsof-holder, mtime-age, and fail-safe
 #      rules.
-#   4. If retries exhaust and the lock is not provably stale, teardown fails as loudly
-#      as a normal return failure and notes that the lock persisted across the retry
-#      window. A missing `lsof`, or a lock that fails any stale check, is treated as
-#      NOT provably stale (fail safe): the lock is left untouched.
+#   4. If retries exhaust and the lock is not provably stale, the helper returns
+#      TEARDOWN_TREEHOUSE_LOCK_REFUSED and notes that the lock persisted across the
+#      retry window. Ordinary task teardown keeps that path fatal. A missing `lsof`,
+#      or a lock that fails any stale check, is treated as NOT provably stale
+#      (fail safe): the lock is left untouched.
 # The same proof is used when non-force safety inspection cannot run because the lock
 # is present; teardown clears only a provably stale lock, then re-runs the safety
 # checks before any destructive return. Teardown output notes every wait, retry, and
@@ -82,17 +85,18 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
-# shellcheck source=bin/fm-tasks-axi-lib.sh
+# shellcheck source=bin/fm-tasks-axi-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
-# shellcheck source=bin/fm-backend.sh
+# shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-lock-lib.sh
+# shellcheck source=bin/fm-lock-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-lock-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
 # down a worktree (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+# shellcheck disable=SC2034  # consumed by fm-lock-lib.sh logging helpers
 FM_LOCK_LOG_PREFIX=teardown
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
@@ -1024,10 +1028,16 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
-    echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-    exit 1
-  }
+  if teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check"; then
+    :
+  else
+    treehouse_return_rc=$?
+    if [ "$treehouse_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
+      echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      exit 1
+    fi
+    echo "warning: treehouse return failed for worktree $WT; continuing teardown state cleanup." >&2
+  fi
 fi
 
 if [ "$BACKEND" != orca ]; then

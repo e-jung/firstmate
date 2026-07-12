@@ -128,6 +128,19 @@ SH
   printf '%s\n' "$case_dir"
 }
 
+make_treehouse_return_fail() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  echo "treehouse pool bookkeeping missing" >&2
+  exit 42
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
 add_compatible_tasks_axi() {
   local case_dir=$1
   cat > "$case_dir/fakebin/tasks-axi" <<'SH'
@@ -588,6 +601,38 @@ test_local_only_merged_to_local_main_allows() {
   pass "local-only worktree with work merged into local main is torn down (no regression)"
 }
 
+test_treehouse_return_failure_still_cleans_state() {
+  local case_dir rc task_tmp wt_head
+  case_dir=$(make_case treehouse-return-fails)
+  task_tmp="$case_dir/tasktmp"
+  write_meta "$case_dir" local-only ship
+  printf 'tasktmp=%s\n' "$task_tmp" >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' "running" > "$case_dir/state/task-x1.status"
+  printf '%s\n' "#!/usr/bin/env bash" > "$case_dir/state/task-x1.check.sh"
+  mkdir -p "$task_tmp"
+  printf '%s\n' "tmp data" > "$task_tmp/payload"
+  wt_commit "$case_dir" "merged work"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/project" update-ref refs/heads/main "$wt_head"
+  make_treehouse_return_fail "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "treehouse-return-fails: teardown should succeed despite treehouse return failure"
+  assert_grep "warning: treehouse return failed for worktree" "$case_dir/stderr" \
+    "treehouse-return-fails: missing visible treehouse return warning"
+  assert_grep "treehouse pool bookkeeping missing" "$case_dir/stderr" \
+    "treehouse-return-fails: missing treehouse failure output"
+  assert_absent "$case_dir/state/task-x1.status" "treehouse-return-fails: status file was not removed"
+  assert_absent "$case_dir/state/task-x1.meta" "treehouse-return-fails: meta file was not removed"
+  assert_absent "$case_dir/state/task-x1.check.sh" "treehouse-return-fails: check file was not removed"
+  assert_absent "$task_tmp" "treehouse-return-fails: tasktmp was not removed"
+  pass "treehouse return failure is warned but does not leave task state behind"
+}
+
 test_no_mistakes_origin_remote_allows() {
   local case_dir rc
   case_dir=$(make_case nm-origin)
@@ -625,6 +670,26 @@ test_no_mistakes_truly_unpushed_refuses() {
   expect_code 1 "$rc" "nm-unpushed: teardown should refuse"
   grep -q REFUSED "$case_dir/stderr" || fail "nm-unpushed: no REFUSED line in stderr"
   pass "no-mistakes worktree with genuinely unlanded work is refused (safety preserved)"
+}
+
+test_treehouse_return_failure_does_not_bypass_unpushed_refusal() {
+  local case_dir rc
+  case_dir=$(make_case return-fail-unpushed-refusal)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "unpushed work"
+  make_treehouse_return_fail "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "return-fail-unpushed-refusal: teardown should still refuse unlanded work"
+  grep -q REFUSED "$case_dir/stderr" || fail "return-fail-unpushed-refusal: no REFUSED line in stderr"
+  assert_no_grep "treehouse return failed" "$case_dir/stderr" \
+    "return-fail-unpushed-refusal: reached treehouse return after safety refusal"
+  assert_present "$case_dir/state/task-x1.meta" "return-fail-unpushed-refusal: meta was removed despite refusal"
+  pass "treehouse return failure path does not weaken unpushed-work refusal"
 }
 
 test_squash_merged_branch_deleted_allows() {
@@ -1268,8 +1333,10 @@ test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
+test_treehouse_return_failure_still_cleans_state
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
+test_treehouse_return_failure_does_not_bypass_unpushed_refusal
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_squash_merged_branch_deleted_allows
