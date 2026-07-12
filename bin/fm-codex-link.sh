@@ -10,6 +10,7 @@
 #   fm-codex-link.sh task <task-id>
 #   fm-codex-link.sh report <task-id-or-report-path>
 #   fm-codex-link.sh project <absolute-project-dir> [prompt]
+#   fm-codex-link.sh <task-id>                     (shorthand for: task <task-id>)
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +20,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 usage() {
-  sed -n '2,12p' "$0" >&2
+  sed -n '2,13p' "$0" >&2
   exit 2
 }
 
