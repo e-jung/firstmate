@@ -6,6 +6,29 @@ The Codex Desktop host-tool loop works, including status-file writes, but Firstm
 This document replaces the earlier passive visible-thread ledger shape.
 A manual ledger is not a backend.
 
+## Deep-link helper
+
+`bin/fm-codex-link.sh` is a captain-facing convenience helper, not a runtime backend.
+It prints local `codex://new` links for opening a task worktree, scout report directory, or project directory in a new Codex task.
+It also prints the raw local path beside each link so the captain can fall back to normal copy/open behavior if the current device does not register the Codex URL scheme.
+
+Use it from the firstmate home:
+
+```sh
+bin/fm-codex-link.sh task <task-id>
+bin/fm-codex-link.sh report <task-id-or-report-path>
+bin/fm-codex-link.sh project <absolute-project-dir> [prompt]
+```
+
+The helper reads only this firstmate home's `state/<id>.meta` and `data/<id>/report.md`.
+It never opens the app, sends a task, starts a backend, writes state, or changes supervision.
+The generated link uses the documented Codex Desktop deep-link shape `codex://new?path=<absolute-dir>&prompt=<text>`.
+Query values are URL-encoded, and the `path` is resolved to an absolute existing local directory before a link is emitted.
+
+For task links, the worktree path wins when it exists.
+If a task has no existing `worktree=`, the helper falls back to an existing `project=` path.
+For report links, the Codex task opens in the report directory and the prompt names the exact report file to review.
+
 ## Backend acceptance contract
 
 A Codex App backend must satisfy the same lifecycle contract as the terminal-backed adapters:
