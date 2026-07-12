@@ -20,6 +20,8 @@ bin/fm-codex-link.sh report <task-id-or-report-path>
 bin/fm-codex-link.sh project <absolute-project-dir> [prompt]
 ```
 
+A bare task id without a subcommand is accepted as shorthand for `task <task-id>`.
+
 The helper reads only this firstmate home's `state/<id>.meta` and `data/<id>/report.md`.
 It never opens the app, sends a task, starts a backend, writes state, or changes supervision.
 The generated link uses the documented Codex Desktop deep-link shape `codex://new?path=<absolute-dir>&prompt=<text>`.
