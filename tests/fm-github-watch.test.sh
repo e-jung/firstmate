@@ -282,4 +282,34 @@ pass "bootstrap registers idempotent github-events check shim"
   [ "$m1" = "$m2" ] || fail "bootstrap re-run churned the shim (not idempotent)"
 }
 
+# ---------------------------------------------------------------------------
+# 12. Discovery dedup is newline-anchored: PR #4 must not be shadowed by #42
+# (or vice versa) when both are supervised in the same repo - a substring match
+# would silently drop the shorter number.
+pass "discovery: PR #4 and #42 in the same repo are both discovered (no substring shadow)"
+{
+  case_dir=$(make_case prefix-shadow)
+  write_pr_meta "$case_dir" task-a4 'https://github.com/acme/widgets/pull/4'
+  write_pr_meta "$case_dir" task-a42 'https://github.com/acme/widgets/pull/42'
+  set_fx "$case_dir" user 'captain'
+  set_fx "$case_dir" pull-4 $'sha4\tOPEN'
+  set_fx "$case_dir" pull-42 $'sha42\tOPEN'
+  set_fx "$case_dir" issue-comments-4 '0'
+  set_fx "$case_dir" issue-comments-42 '0'
+  set_fx "$case_dir" review-comments-4 '0'
+  set_fx "$case_dir" review-comments-42 '0'
+  set_fx "$case_dir" reviews-4 '0'
+  set_fx "$case_dir" reviews-42 '0'
+  set_fx "$case_dir" checks-sha4 'lint:success'
+  set_fx "$case_dir" checks-sha42 'lint:success'
+  run_poll "$case_dir" >/dev/null   # baseline both
+  assert_present "$case_dir/state/.github-watch-seen/acme-widgets-4" "PR #4 seen file missing (shadowed by #42?)"
+  assert_present "$case_dir/state/.github-watch-seen/acme-widgets-42" "PR #42 seen file missing (shadowed by #4?)"
+  # And a new comment on #4 alone wakes for #4 only (not #42, not silent).
+  set_fx "$case_dir" issue-comments-4 '1'
+  out=$(run_poll "$case_dir")
+  assert_contains "$out" "acme/widgets#4 has 1 new comment(s)" "PR #4 comment should wake"
+  assert_not_contains "$out" "#42 has" "PR #42 must not wake from #4's comment"
+}
+
 echo "# fm-github-watch tests: all passed"
