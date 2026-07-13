@@ -132,8 +132,12 @@ discover_supervised_prs() {
     rec=$(parse_pr_url "$url")
     [ -n "$rec" ] || continue
     key=$rec
+    # Anchor the dedup match on the trailing newline so a shorter PR number
+    # (e.g. #4) cannot be shadowed by a longer one already seen (#42): the
+    # stored form is "key\n", so "key\n" only matches a full entry, never a
+    # prefix of one.
     case "$seen" in
-      *"$key"*) continue ;;
+      *"$key"$'\n'*) continue ;;
     esac
     seen="$seen$key"$'\n'
     printf '%s\t%s\n' "$rec" "$url"
@@ -328,8 +332,10 @@ prune_stale_seen() {
     [ -e "$f" ] || continue
     base=${f##*/}
     case "$base" in .tmp.*) continue ;; esac
+    # Newline-anchored match (see discover_supervised_prs): a shorter basename
+    # must not be kept because a longer one (acme-widgets-42 vs -4) contains it.
     case "$supervised" in
-      *"$base"*) ;;
+      *"$base"$'\n'*) ;;
       *) rm -f "$f" 2>/dev/null || true ;;
     esac
   done
