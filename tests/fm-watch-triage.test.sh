@@ -223,6 +223,50 @@ test_crew_absorb_class_classifier() {
   pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
 }
 
+# crew_absorb_class done+paused regression (stale-alert fix): a verified-DONE
+# crew (checks-green/open-PR) whose status log declares paused: (awaiting
+# external PR review/merge) must class as `paused` so the stale path absorbs it
+# on the pause cadence - NOT as a wedge. But a failed/unknown/parked crew, or a
+# done crew that did NOT declare a pause, still classes `none` (surface). The
+# `done` gate is what keeps an unfinished crew surfacing even if a stale paused
+# line lingers in its log.
+test_crew_absorb_class_done_paused_regression() {
+  local dir state fakebin
+  dir=$(make_case absorb-done-paused); state="$dir/state"; fakebin="$dir/fakebin"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_STATE_OVERRIDE="$state"
+  # Per-id canned verdicts (the fake reads FM_FAKE_CREW_STATE_<sanitized-id>).
+  export FM_FAKE_CREW_STATE_donepause FM_FAKE_CREW_STATE_donenopause \
+         FM_FAKE_CREW_STATE_failedpause FM_FAKE_CREW_STATE_unknownpause \
+         FM_FAKE_CREW_STATE_parkedpause
+  printf 'paused: awaiting external PR review/merge\n' > "$state/donepause.status"
+  printf 'done: PR https://github.com/o/r/pull/1 checks green\n' > "$state/donenopause.status"
+  printf 'paused: awaiting external PR review/merge\n' > "$state/failedpause.status"
+  printf 'paused: awaiting external PR review/merge\n' > "$state/unknownpause.status"
+  printf 'paused: awaiting external PR review/merge\n' > "$state/parkedpause.status"
+
+  FM_FAKE_CREW_STATE_donepause='state: done · source: run-step · checks green: PR ready for review'
+  [ "$(crew_absorb_class donepause)" = paused ] || fail "done + paused:awaiting external PR review/merge not absorbed on pause cadence"
+  crew_is_paused donepause || fail "crew_is_paused did not recognize a done+paused crew"
+
+  FM_FAKE_CREW_STATE_donenopause='state: done · source: run-step · checks green: PR ready for review'
+  [ "$(crew_absorb_class donenopause)" = none ] || fail "done WITHOUT a paused declaration absorbed (should surface for teardown/relay)"
+
+  FM_FAKE_CREW_STATE_failedpause='state: failed · source: run-step · run failed'
+  [ "$(crew_absorb_class failedpause)" = none ] || fail "failed crew with a stale paused line absorbed (must surface)"
+
+  FM_FAKE_CREW_STATE_unknownpause='state: unknown · source: none · worktree gone'
+  [ "$(crew_absorb_class unknownpause)" = none ] || fail "unknown crew with a stale paused line absorbed (must surface)"
+
+  FM_FAKE_CREW_STATE_parkedpause='state: parked · source: run-step · parked at review: 1 finding(s)'
+  [ "$(crew_absorb_class parkedpause)" = none ] || fail "parked-at-gate crew with a paused line absorbed (a gate must surface)"
+
+  unset FM_FAKE_CREW_STATE_donepause FM_FAKE_CREW_STATE_donenopause \
+        FM_FAKE_CREW_STATE_failedpause FM_FAKE_CREW_STATE_unknownpause \
+        FM_FAKE_CREW_STATE_parkedpause FM_STATE_OVERRIDE
+  pass "crew_absorb_class: done+paused absorbed on pause cadence; failed/unknown/parked/done-without-pause still surface"
+}
+
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
 # task it references is provably working; if any crew has stopped, or no task can be
 # resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
@@ -588,6 +632,52 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the paused re-surface failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "paused re-surface was not queued"
   pass "a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated"
+}
+
+# The narrow stale-alert regression: a verified-DONE crew (checks-green/open-PR)
+# whose status log declares paused: awaiting external PR review/merge. Before the
+# fix, fm-crew-state.sh's authoritative `done` verdict made crew_absorb_class
+# return `none`, so the watcher surfaced its idle pane as a wedge every cycle
+# even though the crew is deliberately waiting on the captain to merge. Now the
+# done+paused combination classes as `paused` and the stale pane is absorbed on
+# the pause cadence (no wake, no wedge timer, paused flag set) - exactly like a
+# declared pause reported by fm-crew-state.sh itself.
+test_nonterminal_stale_done_and_paused_absorbed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid statusf
+  dir=$(make_case nonterminal-stale-done-paused); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-prready"
+  printf 'idle, awaiting merge' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/prready.meta"
+  statusf="$state/prready.status"
+  # Latest status declares the external wait (not captain-relevant, so the stale
+  # path - not the terminal path - handles it).
+  printf 'paused: awaiting external PR review/merge\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-prready_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle, awaiting merge")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The authoritative verdict is `done` (checks green, PR ready) - the regression
+  # input. crew_absorb_class must still class this `paused` via the status log.
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for a done+paused stale pane (should absorb on pause cadence): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "done+paused stale printed a wake reason during absorb: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "done+paused stale enqueued a wake during absorb"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on done+paused absorb"
+  [ -e "$state/.paused-$key" ] || fail "paused flag not recorded on done+paused absorb"
+  [ ! -e "$state/.stale-since-$key" ] || fail "a done+paused absorb must not start the wedge timer"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a verified-done (checks-green) crew paused awaiting external PR review/merge is absorbed on the pause cadence, not wedge-surfaced"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1103,6 +1193,7 @@ test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
+test_crew_absorb_class_done_paused_regression
 test_signal_crew_provably_working_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
@@ -1116,6 +1207,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_nonterminal_stale_done_and_paused_absorbed
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking
