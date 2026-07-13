@@ -201,8 +201,8 @@ failing_checks() {
     entry=${rest%%;*}
     if [ "$entry" = "$rest" ]; then rest=""; else rest=${rest#*;}; fi
     [ -n "$entry" ] || continue
-    name=${entry%%:*}
-    concl=${entry#*:}
+    name=${entry%:*}
+    concl=${entry##*:}
     if printf '%s' "$concl" | grep -qE "$CI_FAILURE_CONCLUSIONS"; then
       printf '%s\n' "$name"
     fi
@@ -258,7 +258,9 @@ process_pr() {
   # Only watch open PRs. A merged/closed PR is the merge monitor's job; skip it
   # so a briefly-not-yet-torn-down meta does not waste the comment/review/CI
   # calls. state empty = the fetch failed: carry everything forward silently.
-  if [ -n "$state" ] && [ "$state" != "OPEN" ]; then
+  # The REST pulls endpoint returns lowercase "open"/"closed" (unlike GraphQL's
+  # uppercase state enum), so compare against the REST casing.
+  if [ -n "$state" ] && [ "$state" != "open" ]; then
     return 0
   fi
 

@@ -87,7 +87,7 @@ run_poll() {
 # comments/reviews/failures. Tests mutate from this baseline.
 seed_clean_pr() {
   set_fx "$1" user 'captain'
-  set_fx "$1" pull-42 $'deadbeef\tOPEN'
+  set_fx "$1" pull-42 $'deadbeef\topen'
   set_fx "$1" issue-comments-42 '0'
   set_fx "$1" review-comments-42 '0'
   set_fx "$1" reviews-42 '0'
@@ -208,6 +208,26 @@ pass "failed CI wakes once; same failure repeat is silent"
 }
 
 # ---------------------------------------------------------------------------
+# 6b. A check-run NAME containing a colon still parses its conclusion
+# correctly (split on the last colon, not the first), so the failure is
+# surfaced rather than silently swallowed. GitHub Actions job names like
+# "Test: Unit" produce entries "Test: Unit:failure".
+pass "failed CI: check name with colon is parsed and surfaced"
+{
+  case_dir=$(make_case ci-fail-colon)
+  write_pr_meta "$case_dir" task-a1 'https://github.com/acme/widgets/pull/42'
+  seed_clean_pr "$case_dir"
+  run_poll "$case_dir" >/dev/null   # baseline (checks passing)
+  set_fx "$case_dir" checks-deadbeef 'Test: Unit:failure;lint:success'
+  out=$(run_poll "$case_dir")
+  assert_contains "$out" "CI: acme/widgets#42 check(s) failed" "CI event missing"
+  assert_contains "$out" "Test: Unit" "CI event should name colon-containing check"
+  assert_not_contains "$out" "Unit:failure" "conclusion must not bleed into the check name"
+  out=$(run_poll "$case_dir")
+  [ -z "$out" ] || fail "repeat CI-failure (colon name) poll should be silent, got: $out"
+}
+
+# ---------------------------------------------------------------------------
 # 7. Dedup: multiple polls with no new info never re-emit (across all signals).
 pass "dedup: repeated no-info polls stay silent across signals"
 {
@@ -255,7 +275,7 @@ pass "closed PR skipped without emitting"
   case_dir=$(make_case closed)
   write_pr_meta "$case_dir" task-a1 'https://github.com/acme/widgets/pull/42'
   set_fx "$case_dir" user 'captain'
-  set_fx "$case_dir" pull-42 $'deadbeef\tCLOSED'
+  set_fx "$case_dir" pull-42 $'deadbeef\tclosed'
   set_fx "$case_dir" issue-comments-42 '9'
   set_fx "$case_dir" reviews-42 '2'
   out=$(run_poll "$case_dir")
@@ -274,7 +294,7 @@ pass "seen file for a no-longer-supervised PR is pruned"
   # A different PR is now supervised.
   write_pr_meta "$case_dir" task-a1 'https://github.com/acme/widgets/pull/42'
   set_fx "$case_dir" user 'captain'
-  set_fx "$case_dir" pull-42 $'deadbeef\tOPEN'
+  set_fx "$case_dir" pull-42 $'deadbeef\topen'
   set_fx "$case_dir" issue-comments-42 '0'
   set_fx "$case_dir" review-comments-42 '0'
   set_fx "$case_dir" reviews-42 '0'
@@ -315,8 +335,8 @@ pass "discovery: PR #4 and #42 in the same repo are both discovered (no substrin
   write_pr_meta "$case_dir" task-a4 'https://github.com/acme/widgets/pull/4'
   write_pr_meta "$case_dir" task-a42 'https://github.com/acme/widgets/pull/42'
   set_fx "$case_dir" user 'captain'
-  set_fx "$case_dir" pull-4 $'sha4\tOPEN'
-  set_fx "$case_dir" pull-42 $'sha42\tOPEN'
+  set_fx "$case_dir" pull-4 $'sha4\topen'
+  set_fx "$case_dir" pull-42 $'sha42\topen'
   set_fx "$case_dir" issue-comments-4 '0'
   set_fx "$case_dir" issue-comments-42 '0'
   set_fx "$case_dir" review-comments-4 '0'
