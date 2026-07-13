@@ -45,8 +45,11 @@
 #
 # Seen state: state/.github-watch-seen/<owner>-<repo>-<num> (key=value lines):
 #   comments=<high-water count of non-self issue + review comments>
-#   changes_requested=<high-water count of non-self CHANGES_REQUESTED reviews>
+#   changes_requested=<current count of non-self CHANGES_REQUESTED reviews>
 #   ci=<sorted 'name:conclusion' signature of completed check-runs>
+# comments is high-water because comments only accumulate; changes_requested is
+# current count because reviews are dismissable, so a dismiss->re-request where
+# the count drops then rises must fire again.
 # A seen file whose PR is no longer in any state/*.meta pr= line is pruned.
 set -u
 
@@ -172,8 +175,8 @@ count_review_comments() {
     --jq '[.[] | select(.user.login != env.SELF)] | length'
 }
 
-# count changes-requested reviews excluding self (high-water: each new request
-# changes review increments this).
+# count changes-requested reviews excluding self (current count: reviews are
+# dismissable, so the cursor tracks the live count and a rise re-fires).
 count_changes_requested() {
   SELF="$SELF_LOGIN" ghc "repos/$1/$2/pulls/$3/reviews?per_page=100" \
     --jq '[.[] | select(.user.login != env.SELF) | select(.state == "CHANGES_REQUESTED")] | length'
@@ -228,7 +231,7 @@ build_seen() {
     if is_int "$seen_c"; then new_c=$((seen_c > c_count ? seen_c : c_count)); else new_c=$c_count; fi
   fi
   if is_int "$cr_count"; then
-    if is_int "$seen_cr"; then new_cr=$((seen_cr > cr_count ? cr_count : cr_count)); else new_cr=$cr_count; fi
+    new_cr=$cr_count
   fi
   ci_val=$ci_sig
   [ -n "$ci_val" ] || ci_val=$seen_ci
@@ -282,7 +285,8 @@ process_pr() {
     ev=$(printf '%sCOMMENT: %s/%s#%s has %d new comment(s)\n' \
       "$ev" "$owner" "$repo" "$num" "$((c_count - seen_c))")
   fi
-  # changes-requested (high-water): event on increase only.
+  # changes-requested (current count): event on increase only; a dismiss drops
+  # the cursor silently so a later re-request fires again.
   if is_int "$cr_count" && is_int "$seen_cr" && [ "$cr_count" -gt "$seen_cr" ]; then
     ev=$(printf '%sCHANGES_REQUESTED: %s/%s#%s\n' "$ev" "$owner" "$repo" "$num")
   fi
