@@ -168,6 +168,29 @@ pass "changes-requested wakes once; repeat is silent"
 }
 
 # ---------------------------------------------------------------------------
+# 5b. changes-requested tracks CURRENT count, not high-water: a dismiss drops
+# the cursor silently, so a later re-request (count rising again) fires again.
+# A high-water cursor would pin at the peak and swallow the re-request alert.
+pass "changes-requested: dismiss then re-request fires again (current-count cursor)"
+{
+  case_dir=$(make_case changes-req-rerequest)
+  write_pr_meta "$case_dir" task-a1 'https://github.com/acme/widgets/pull/42'
+  seed_clean_pr "$case_dir"
+  set_fx "$case_dir" reviews-42 '2'   # two CHANGES_REQUESTED reviews
+  run_poll "$case_dir" >/dev/null     # baseline pins cursor at 2
+  # Reviewer dismisses one review: count drops to 1. No event (decrease), and
+  # the cursor must follow it down so a re-request can fire.
+  set_fx "$case_dir" reviews-42 '1'
+  out=$(run_poll "$case_dir")
+  [ -z "$out" ] || fail "dismiss (count drop) should be silent, got: $out"
+  # Reviewer requests changes again: count rises back to 2. Must fire, because
+  # the cursor followed the dismiss down to 1.
+  set_fx "$case_dir" reviews-42 '2'
+  out=$(run_poll "$case_dir")
+  assert_contains "$out" "CHANGES_REQUESTED: acme/widgets#42" "re-request after dismiss should fire again"
+}
+
+# ---------------------------------------------------------------------------
 # 6. Newly failed CI check wakes once; same failure next poll is silent.
 pass "failed CI wakes once; same failure repeat is silent"
 {
