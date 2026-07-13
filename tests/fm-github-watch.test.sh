@@ -83,6 +83,12 @@ run_poll() {
     bash "$GH_WATCH" --once 2>/dev/null
 }
 
+# Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
+# fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
+file_mtime() {
+  if [ "$(uname)" = Darwin ]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi
+}
+
 # Default open-PR fixture set for PR acme/widgets#42 at sha deadbeef, no
 # comments/reviews/failures. Tests mutate from this baseline.
 seed_clean_pr() {
@@ -316,12 +322,12 @@ pass "bootstrap registers idempotent github-events check shim"
   shim="$case_dir/state/github-events.check.sh"
   assert_present "$shim" "bootstrap should write the github-events check shim"
   assert_grep "fm-github-watch.sh" "$shim" "shim should exec the watcher"
-  m1=$(stat -c %Y "$shim")
+  m1=$(file_mtime "$shim")
   sleep 1.1
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir" FM_STATE_OVERRIDE="$case_dir/state" \
     FM_CONFIG_OVERRIDE="$case_dir/config" FM_PROJECTS_OVERRIDE="$case_dir/projects" \
     bash "$BOOTSTRAP" >/dev/null 2>&1
-  m2=$(stat -c %Y "$shim")
+  m2=$(file_mtime "$shim")
   [ "$m1" = "$m2" ] || fail "bootstrap re-run churned the shim (not idempotent)"
 }
 
