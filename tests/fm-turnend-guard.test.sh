@@ -20,6 +20,10 @@ TMP_ROOT=$(fm_test_tmproot fm-turnend-guard)
 fm_git_identity fmtest fmtest@example.invalid
 
 REQUIRED_REASON='resume supervision with bin/fm-watch-arm.sh as its own Claude Code background task'
+# When the guard fires WHILE away mode is on, the repair line correctly points at
+# the afk daemon rather than the normal watcher arm (the normal path would be
+# wrong: away mode must not start a competing foreground watcher).
+AFK_REASON='Away mode owns watcher supervision; load /afk and ensure the daemon is running instead of starting normal supervision directly.'
 
 # --- PREDICATE: bin/fm-supervision-lib.sh -----------------------------------
 
@@ -92,6 +96,9 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  # fm-afk-start.sh owns the away-mode daemon-liveness contract reused by the
+  # guard's away-mode health path (sourced by fm-turnend-guard.sh when .afk).
+  cp "$ROOT/bin/fm-afk-start.sh" "$dir/bin/fm-afk-start.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -268,6 +275,85 @@ test_hook_blocks_with_live_lock_and_stale_beacon() {
   expect_code 2 "$status" "hook must block when a live watcher lock has an ancient beacon"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: blocks on a live watcher lock with an ancient beacon"
+}
+
+# --- HOOK: away-mode (sub-supervisor daemon) health -------------------------
+#
+# While state/.afk is present the away-mode daemon owns the watcher and runs it
+# one-shot per poll, so no foreground watcher holds the home watch-lock and the
+# lock-based fm_watcher_healthy check fails even though supervision is healthy.
+# The guard must treat a LIVE daemon plus a FRESH beacon as healthy (silent),
+# while still firing for a dead daemon or a stale beacon - a genuinely dark
+# away-mode primary is exactly the gap the guard exists to catch. Together with
+# test_hook_blocks_when_unhealthy_in_primary (afk off, no watcher -> fire) and
+# test_hook_silent_with_live_lock_and_fresh_beacon (afk off, live watcher ->
+# silent), these cover all four away-mode-aware health cases.
+
+record_daemon_lock() {
+  local dir=$1 pid=$2 identity=$3
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$identity" > "$dir/state/.supervise-daemon.lock/pid-identity"
+}
+
+test_hook_afk_silent_with_live_daemon_and_fresh_beacon() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-live")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live daemon holder"
+  }
+  record_daemon_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must be silent in away mode when the daemon is live and the beacon is fresh"
+  [ -z "$out" ] || fail "hook produced output despite a live away-mode daemon and fresh beacon: $out"
+  pass "fm-turnend-guard: silent in away mode with a live daemon and a fresh beacon"
+}
+
+test_hook_afk_blocks_with_dead_daemon() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-dead-daemon")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  dead=$(nonexistent_pid)
+  record_daemon_lock "$dir" "$dead" "dead daemon identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must fire in away mode when the daemon lock pid is dead despite a fresh beacon"
+  assert_contains "$out" "$AFK_REASON" "afk-mode block reason must point at the afk daemon, not the normal watcher arm"
+  assert_contains "$out" "TURN WOULD END BLIND" "block banner must read as an alarm"
+  pass "fm-turnend-guard: fires in away mode when the daemon is dead (fresh beacon alone is not enough)"
+}
+
+test_hook_afk_blocks_with_stale_beacon() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-stale-beacon")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live daemon holder"
+  }
+  record_daemon_lock "$dir" "$pid" "$identity"
+  touch -t 202001010000 "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must fire in away mode when the beacon is stale despite a live daemon"
+  assert_contains "$out" "$AFK_REASON" "afk-mode block reason must point at the afk daemon, not the normal watcher arm"
+  assert_contains "$out" "TURN WOULD END BLIND" "block banner must read as an alarm"
+  pass "fm-turnend-guard: fires in away mode when the beacon is stale (live daemon alone is not enough)"
 }
 
 test_hook_blocks_when_unhealthy_in_primary() {
@@ -562,7 +648,7 @@ test_grok_adapter_forces_one_resume_when_unhealthy() {
 } >> "$log"
 EOF
   chmod +x "$fakebin/grok"
-  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_HOME="$dir" bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must fail open after queuing a forced resume"
   [ -z "$out" ] || fail "grok adapter printed output: $out"
   assert_contains "$(cat "$log")" 'active=1' "grok adapter must mark its forced resume as loop-guarded"
@@ -585,7 +671,7 @@ test_grok_adapter_loop_guard_skips_resume() {
 printf 'called\n' >> "$log"
 EOF
   chmod +x "$fakebin/grok"
-  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" GROK_TURNEND_GUARD_ACTIVE=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
+  out=$(printf '{"sessionId":"session-test","hookEventName":"stop"}' | PATH="$fakebin:$PATH" GROK_WORKSPACE_ROOT="$dir" FM_HOME="$dir" GROK_TURNEND_GUARD_ACTIVE=1 bash "$dir/bin/fm-turnend-guard-grok.sh" 2>&1); status=$?
   expect_code 0 "$status" "grok adapter must allow its own forced resume turn to end"
   [ -z "$out" ] || fail "grok adapter printed output while loop-guarded: $out"
   [ ! -e "$log" ] || fail "grok adapter spawned another resume while loop-guarded: $(cat "$log")"
@@ -894,6 +980,9 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
+test_hook_afk_silent_with_live_daemon_and_fresh_beacon
+test_hook_afk_blocks_with_dead_daemon
+test_hook_afk_blocks_with_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
