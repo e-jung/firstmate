@@ -1062,9 +1062,13 @@ test_below_max_defer_does_nothing() {
   escalate_add "$state" "needs-decision: pick A"
   date +%s > "$state/.subsuper-escalations.since"   # just now
   afk_enter "$state"
+  # FM_CANARY_INTERVAL_SECS=0 isolates the max-defer path: this test's "stuck
+  # junk line" capture reads as a pending composer, which the canary (a separate
+  # early-wedge trigger) would correctly flag. The canary has its own coverage below.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
     FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
-    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=300 housekeeping "$state"
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=300 FM_CANARY_INTERVAL_SECS=0 \
+    housekeeping "$state"
   [ ! -s "$sent" ] || fail "injected before MAX_DEFER elapsed"
   [ ! -e "$state/.subsuper-inject-wedged" ] || fail "wedge alarm fired before MAX_DEFER"
   [ -s "$state/.subsuper-escalations" ] || fail "buffer dropped below MAX_DEFER"
@@ -1421,6 +1425,300 @@ test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
   pass "in-process wedge throttle prevents alert spam when the marker cannot persist"
 }
 
+# --- early-wedge safeguard 1: defer-streak alarm ----------------------------
+# A rising streak of non-busy inject deferrals on a still-pending escalation is
+# a classifier failure. It raises the SAME inject_wedge_alarm as max-defer, on a
+# COUNT bound instead of a time bound. These isolate the streak by disabling the
+# other two triggers (FM_MAX_DEFER_SECS=0, FM_CANARY_INTERVAL_SECS=0).
+# Every alarm routes through the FM_WEDGE_ALARM_EXEC recorder (wake-helpers.sh),
+# so no test posts a real notification.
+
+test_defer_streak_fires_at_threshold() {
+  local dir state fakebin sent capture log
+  dir=$(make_supercase defer-streak-fire)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; printf 'human draft text\n' > "$capture"
+  log="$dir/alert.log"; : > "$log"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  for _ in 1 2 3; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=3 FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+      housekeeping "$state"
+  done
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "defer-streak did not raise the wedge marker at threshold"
+  [ "$(cat "$state/.subsuper-defer-streak" 2>/dev/null || echo 0)" = "3" ] \
+    || fail "defer-streak count not at threshold: $(cat "$state/.subsuper-defer-streak" 2>/dev/null)"
+  grep -F 'defer-streak=3' "$log" >/dev/null || fail "streak alarm did not carry its tag: $(cat "$log")"
+  grep -F 'osascript' "$log" >/dev/null || fail "streak alarm did not route through the notifier seam"
+  [ ! -s "$sent" ] || fail "streak path injected text (should only read/defer)"
+  pass "defer-streak raises the wedge alarm at the configured threshold via the shared notifier"
+}
+
+test_defer_streak_resets_on_successful_delivery() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase defer-streak-reset-success)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  printf 'human draft text\n' > "$capture"
+  for _ in 1 2; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=3 housekeeping "$state"
+  done
+  [ "$(cat "$state/.subsuper-defer-streak" 2>/dev/null || echo 0)" = "2" ] \
+    || fail "streak should be 2 before the reset"
+  # Now make the composer empty + submittable: a bordered empty box clears on Enter.
+  printf '│ > │\n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+    FM_DEFER_STREAK_MAX=3 FM_INJECT_CONFIRM_SLEEP=0.05 housekeeping "$state"
+  [ ! -e "$state/.subsuper-defer-streak" ] || fail "streak not reset after a confirmed delivery"
+  [ ! -e "$state/.subsuper-defer-streak-fired" ] || fail "streak fired-sentinel not cleared after delivery"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "streak never reached threshold but a wedge marker exists"
+  pass "a confirmed delivery resets the defer streak and its fired sentinel"
+}
+
+test_defer_streak_resets_on_busy_pane() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase defer-streak-reset-busy)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  printf 'human draft text\n' > "$capture"
+  for _ in 1 2; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=3 housekeeping "$state"
+  done
+  [ "$(cat "$state/.subsuper-defer-streak" 2>/dev/null || echo 0)" = "2" ] \
+    || fail "streak should be 2 before the busy reset"
+  # A busy pane is a legitimate defer (agent mid-turn): it breaks the streak.
+  printf 'esc to interrupt\n' > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+    FM_DEFER_STREAK_MAX=3 housekeeping "$state"
+  [ ! -e "$state/.subsuper-defer-streak" ] || fail "a busy-pane defer did not reset the streak"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "a busy pane raised a wedge alarm"
+  pass "a busy-pane defer (healthy) resets the streak without alarming"
+}
+
+test_defer_streak_disabled_and_noop_when_afk_off() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase defer-streak-afk-off)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; printf 'human draft text\n' > "$capture"
+  escalate_add "$state" "needs-decision: pick A"
+  # afk deliberately NOT entered.
+  for _ in 1 2 3 4; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=3 housekeeping "$state"
+  done
+  [ ! -e "$state/.subsuper-defer-streak" ] || fail "streak counted defers while afk was off"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "streak alarmed while afk was off"
+  pass "defer-streak is a strict no-op (resets, never alarms) when afk is off"
+}
+
+test_defer_streak_disabled_when_threshold_zero() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase defer-streak-disabled)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; printf 'human draft text\n' > "$capture"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  for _ in 1 2 3 4 5; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=0 housekeeping "$state"
+  done
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "streak alarmed with FM_DEFER_STREAK_MAX=0"
+  pass "FM_DEFER_STREAK_MAX=0 disables the defer-streak trigger"
+}
+
+# The streak and max-defer share inject_wedge_alarm's marker-window dedup: once
+# one fires and writes the marker, the other is suppressed within the window.
+test_defer_streak_dedupes_with_max_defer_within_window() {
+  local dir state log
+  dir=$(make_wedge_case streak-maxdefer-dedup)
+  state="$dir/state"; log="$dir/alert.log"; : > "$log"
+  escalate_add "$state" "needs-decision: pick A"
+  afk_enter "$state"
+  WEDGE_ALARM_LAST_EPOCH=0
+  # Streak trigger fires first.
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript FM_MAX_DEFER_SECS=600 \
+    FM_SUPERVISOR_BACKEND=herdr inject_wedge_alarm "$state" 120 "defer-streak=8"
+  # Max-defer trigger arrives inside the same window: must be suppressed.
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript FM_MAX_DEFER_SECS=600 \
+    FM_SUPERVISOR_BACKEND=herdr inject_wedge_alarm "$state" 300
+  local alerts
+  alerts=$(grep -c 'osascript' "$log" 2>/dev/null || true)
+  [ "$alerts" -eq 1 ] || fail "max-defer re-fired within the streak's marker window ($alerts alerts)"
+  pass "defer-streak and max-defer share inject_wedge_alarm's dedup window (no double-fire)"
+}
+
+# --- early-wedge safeguard 2: end-to-end wake-path canary -------------------
+# A periodic no-inject probe of the full supervisor wake path. It never types,
+# so it cannot inject junk; it alarms only when an idle pane cannot confirm an
+# inject would land. Verdict logic is driven through stubbed backend primitives
+# (the same pattern the herdr inject_msg tests use), so detection is deterministic.
+
+# Helper: run wake_canary in a subshell with stubbed backend primitives. $1=state,
+# $2=exists(0|1), $3=busy_state, $4=composer_state, $5=capture-text. Sets
+# FM_SUPERVISOR_TARGET/BACKEND and afk on. WEDGE_ALARM_LAST_EPOCH is reset so the
+# in-process throttle a prior test left behind does not suppress this probe's alarm.
+_run_canary_stubbed() {
+  local state=$1 exists=$2 bstate=$3 cstate=$4 capture=$5 log=$6
+  : > "$log"
+  (
+    fm_backend_target_exists() { [ "$exists" = 1 ]; }
+    fm_backend_busy_state() { printf '%s' "$bstate"; }
+    fm_backend_capture() { printf '%s\n' "$capture"; }
+    fm_backend_composer_state() { printf '%s' "$cstate"; }
+    WEDGE_ALARM_LAST_EPOCH=0 \
+    FM_SUPERVISOR_TARGET=fakepane FM_SUPERVISOR_BACKEND=tmux \
+    FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    FM_CANARY_INTERVAL_SECS=1 wake_canary "$state"
+  )
+}
+
+test_canary_healthy_on_empty_composer() {
+  local dir state log
+  dir=$(make_supercase canary-healthy-empty); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"
+  _run_canary_stubbed "$state" 1 idle empty 'idle prompt' "$log"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "canary alarmed on a healthy empty composer"
+  [ ! -s "$log" ] || fail "canary notified on a healthy empty composer: $(cat "$log")"
+  [ -e "$state/.subsuper-last-canary" ] || fail "canary did not record its probe timestamp"
+  pass "canary: an idle pane with an empty composer is healthy (inject would land)"
+}
+
+test_canary_healthy_on_busy_pane() {
+  local dir state log
+  dir=$(make_supercase canary-healthy-busy); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"
+  _run_canary_stubbed "$state" 1 busy pending 'esc to interrupt' "$log"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "canary alarmed on a healthy busy pane"
+  [ ! -s "$log" ] || fail "canary notified on a healthy busy pane: $(cat "$log")"
+  pass "canary: a busy pane is healthy (legitimate defer)"
+}
+
+test_canary_broken_on_pending_idle_composer() {
+  local dir state log
+  dir=$(make_supercase canary-broken-pending); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"
+  _run_canary_stubbed "$state" 1 idle pending 'composer ghost' "$log"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "canary did not raise the wedge marker on idle+pending"
+  grep -F 'canary:' "$log" >/dev/null || fail "canary alarm did not carry its tag: $(cat "$log")"
+  grep -F 'classifier wedge' "$state/.subsuper-inject-wedged" >/dev/null \
+    || fail "canary marker did not name the classifier-wedge verdict"
+  pass "canary: an idle pane with a pending composer is BROKEN (classifier wedge) and alarms"
+}
+
+test_canary_broken_on_dead_shell_unknown() {
+  local dir state log
+  dir=$(make_supercase canary-broken-unknown); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"
+  _run_canary_stubbed "$state" 1 idle unknown '$ ' "$log"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "canary did not raise the wedge marker on idle+unknown (dead shell)"
+  pass "canary: an idle pane with an unknown composer (dead shell / unreadable) is BROKEN and alarms"
+}
+
+test_canary_broken_on_target_gone() {
+  local dir state log
+  dir=$(make_supercase canary-broken-gone); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"
+  _run_canary_stubbed "$state" 0 idle empty 'idle prompt' "$log"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "canary did not raise the wedge marker when the target is gone"
+  grep -F 'target gone' "$state/.subsuper-inject-wedged" >/dev/null \
+    || fail "canary marker did not name the gone-target verdict"
+  pass "canary: a missing supervisor target is BROKEN and alarms"
+}
+
+test_canary_noop_when_afk_off() {
+  local dir state log calls
+  dir=$(make_supercase canary-afk-off); state="$dir/state"
+  log="$dir/alert.log"; calls="$dir/calls"
+  : > "$calls"
+  # afk deliberately NOT entered. The canary must not even probe.
+  (
+    fm_backend_target_exists() { printf 'x' >> "$1"; return 1; }
+    fm_backend_busy_state() { printf 'x' >> "$calls"; printf idle; }
+    fm_backend_composer_state() { printf 'x' >> "$calls"; printf empty; }
+    FM_SUPERVISOR_TARGET=fakepane FM_SUPERVISOR_BACKEND=tmux \
+    FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    FM_CANARY_INTERVAL_SECS=1 wake_canary "$state"
+  )
+  [ ! -s "$calls" ] || fail "canary probed the pane while afk was off"
+  [ ! -e "$state/.subsuper-last-canary" ] || fail "canary recorded a probe timestamp while afk was off"
+  [ ! -s "$log" ] || fail "canary notified while afk was off"
+  pass "canary is a strict no-op (no probe, no timestamp, no alarm) when afk is off"
+}
+
+test_canary_respects_interval() {
+  local dir state log calls
+  dir=$(make_supercase canary-interval); state="$dir/state"
+  afk_enter "$state"
+  log="$dir/alert.log"; calls="$dir/calls"; : > "$calls"
+  # A fresh probe timestamp means the interval gate has not elapsed: the canary
+  # must return without probing (no composer read, no marker).
+  date +%s > "$state/.subsuper-last-canary"
+  (
+    fm_backend_target_exists() { printf 'x' >> "$calls"; return 0; }
+    fm_backend_busy_state() { printf 'x' >> "$calls"; printf idle; }
+    fm_backend_capture() { printf 'x' >> "$calls"; printf 'idle\n'; }
+    fm_backend_composer_state() { printf 'x' >> "$calls"; printf pending; }
+    FM_SUPERVISOR_TARGET=fakepane FM_SUPERVISOR_BACKEND=tmux \
+    FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    FM_CANARY_INTERVAL_SECS=900 wake_canary "$state"
+  )
+  [ ! -s "$calls" ] || fail "canary probed before its interval elapsed"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "canary alarmed before its interval elapsed"
+  pass "canary does not probe before FM_CANARY_INTERVAL_SECS has elapsed"
+}
+
+test_canary_never_injects_text() {
+  local dir state fakebin sent capture log
+  dir=$(make_supercase canary-no-inject)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; printf 'human draft text\n' > "$capture"
+  log="$dir/alert.log"; : > "$log"
+  afk_enter "$state"
+  # BROKEN verdict (pending composer) drives the alarm path end to end through
+  # the real tmux fakebin. The canary must read the composer but never send-keys.
+  WEDGE_ALARM_LAST_EPOCH=0 \
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=osascript \
+    FM_CANARY_INTERVAL_SECS=1 FM_SUPERVISOR_TARGET=fakepane FM_SUPERVISOR_BACKEND=tmux \
+    wake_canary "$state"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "canary did not alarm on a pending composer"
+  [ ! -s "$sent" ] || fail "canary injected visible junk into the pane: $(cat "$sent")"
+  pass "canary alarms on a broken path without ever injecting text"
+}
+
 test_fm_send_exits_nonzero_on_confirmed_swallow() {
   # fm-send.sh must exit NON-ZERO when a steer's Enter is positively swallowed
   # (text left in the composer), so firstmate learns the instruction did not land
@@ -1734,6 +2032,20 @@ test_wedge_alarm_hung_override_times_out_and_falls_through
 test_wedge_alarm_shutdown_stops_active_notifier_group
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
+test_defer_streak_fires_at_threshold
+test_defer_streak_resets_on_successful_delivery
+test_defer_streak_resets_on_busy_pane
+test_defer_streak_disabled_and_noop_when_afk_off
+test_defer_streak_disabled_when_threshold_zero
+test_defer_streak_dedupes_with_max_defer_within_window
+test_canary_healthy_on_empty_composer
+test_canary_healthy_on_busy_pane
+test_canary_broken_on_pending_idle_composer
+test_canary_broken_on_dead_shell_unknown
+test_canary_broken_on_target_gone
+test_canary_noop_when_afk_off
+test_canary_respects_interval
+test_canary_never_injects_text
 test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure
 test_discover_supervisor_backend_precedence
