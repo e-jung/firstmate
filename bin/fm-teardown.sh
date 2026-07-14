@@ -91,7 +91,7 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-lock-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-lock-lib.sh"
-# shellcheck source=bin/fm-gate-refuse-lib.sh
+# shellcheck source=bin/fm-gate-refuse-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
 # down a worktree (see bin/fm-gate-refuse-lib.sh).
