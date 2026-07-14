@@ -3,9 +3,9 @@
 #
 # Inert by default: a HARD no-op (exit 0, no output) unless X mode is configured
 # via a non-empty FMX_PAIRING_TOKEN (from the home's .env or the environment).
-# This script is the body of the watcher check shim state/x-watch.check.sh, where
-# the contract is "output => wake firstmate, silence => keep sleeping", so the
-# no-op keeps the watcher behaving exactly as today until a user opts in.
+# This script is the body of the watcher check shim state/x-watch.check.sh, so
+# the hard no-op keeps the watcher behaving exactly as today until a user opts
+# in: a check that prints nothing never produces a wake.
 #
 # Behavior when X mode is on:
 #   HTTP 204 / empty / missing text              -> print nothing, exit 0 (no wake)

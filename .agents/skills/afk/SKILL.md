@@ -141,7 +141,7 @@ Classify each wake this way:
   -> self-handle. Captain-relevant verb -> escalate.
 - `signal` or `stale` for a declared `paused:` external wait -> self-handle and track the pause rather than a wedge.
   If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one awaiting-external recheck and resets the pause window.
-- `check` -> always escalate. Check scripts print only when firstmate should wake.
+- `check` -> always escalate. The watcher emits a check wake only for a genuine state change (deduped steady-state output) or a swallowed terminal transition (catch-all), so it is always actionable.
 - `stale` with a terminal status -> escalate. Non-terminal stale is transient:
   record a marker and self-handle. If the pane is still idle past
   `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a
