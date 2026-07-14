@@ -33,7 +33,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|opencode2|pi|grok)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -284,7 +284,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|opencode2|pi|grok)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -345,6 +345,11 @@ launch_template() {
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
     grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    # opencode2 has no TUI and no pane: launch is API-driven (server ensure +
+    # session.create + session.prompt), handled by the oc2 branch below, not by
+    # the send-text/Enter path. This placeholder only satisfies the
+    # unverified-adapter guard (launch_template must succeed for a known harness).
+    opencode2) printf '%s' '__OC2_LAUNCH__' ;;
     *) return 1 ;;
   esac
 }
@@ -384,6 +389,25 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# opencode2 harness forces backend=oc2: it has no terminal pane, so the pane
+# backends (tmux/herdr/zellij/orca/cmux) are structurally wrong for it. The oc2
+# backend drives sessions over the opencode2 HTTP API instead. This override
+# happens after harness resolution so an explicit `--harness opencode2` or a
+# config/crew-harness=opencode2 setting both force oc2, regardless of any prior
+# --backend / FM_BACKEND / config/backend / auto-detection resolution.
+if [ "$HARNESS" = opencode2 ]; then
+  if [ "$KIND" = secondmate ]; then
+    echo "error: opencode2 harness does not support --secondmate spawns yet" >&2
+    exit 1
+  fi
+  if [ "$BACKEND_SET" -eq 1 ] && [ "$BACKEND_ARG" != oc2 ]; then
+    echo "warning: --harness opencode2 forces --backend oc2 (ignoring --backend $BACKEND_ARG)" >&2
+  fi
+  BACKEND=oc2
+  fm_backend_validate_spawn "$BACKEND" || exit 1
+  fm_backend_source "$BACKEND" || exit 1
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -432,7 +456,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|grok)
+    claude|codex|opencode|opencode2|pi|grok)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -691,6 +715,89 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     exit 1
   fi
 }
+
+# --- opencode2 launch path (API-driven, no pane) -----------------------------
+# oc2 diverges completely from the pane-based spawn flow: it leases a worktree
+# via `treehouse get --lease` (no pane to cd), ensures the shared opencode2
+# server, creates a session with the model+variant, submits the brief as the
+# initial prompt over the HTTP API, and records the session as the task's
+# endpoint. No pane is created, no turn-end plugin is installed, and no
+# send-text/Enter is run. After this block, the script exits; the pane-based
+# flow below is never reached for an oc2 task.
+if [ "$BACKEND" = oc2 ]; then
+  # Resolve model into provider/model_id. Default: zai-coding-plan/glm-5.2 (the
+  # fleet's primary provider). Accept "provider/model" or bare "model".
+  oc2_model="${MODEL:-}"
+  case "$oc2_model" in
+    ''|default) oc2_provider='zai-coding-plan'; oc2_model_id='glm-5.2' ;;
+    */*) oc2_provider=${oc2_model%%/*}; oc2_model_id=${oc2_model#*/} ;;
+    *) oc2_provider='zai-coding-plan'; oc2_model_id="$oc2_model" ;;
+  esac
+  # Map firstmate's effort axis to opencode2's variant (max/medium/high/default).
+  case "${EFFORT:-default}" in
+    max) oc2_variant='max' ;;
+    xhigh) oc2_variant='high' ;;
+    high) oc2_variant='high' ;;
+    medium) oc2_variant='medium' ;;
+    low) oc2_variant='default' ;;
+    ''|default) oc2_variant='max' ;;
+    *) oc2_variant='max' ;;
+  esac
+
+  # Lease a worktree without opening a subshell (no pane needed). treehouse get
+  # --lease prints only the worktree path to stdout; banners go to stderr.
+  WT=$(cd "$PROJ_ABS" && treehouse get --lease --lease-holder "fm-$ID" 2>/dev/null) || {
+    echo "error: treehouse get --lease failed for $ID in $PROJ_ABS" >&2; exit 1; }
+  [ -n "$WT" ] || { echo "error: treehouse get --lease returned empty path for $ID" >&2; exit 1; }
+  validate_spawn_worktree "treehouse get --lease" "oc2 session"
+
+  # Per-task temp root (same as pane-based tasks; fm-teardown removes it).
+  TASK_TMP="/tmp/fm-$ID"
+  mkdir -p "$TASK_TMP/gotmp"
+
+  # Ensure the shared opencode2 server is running.
+  OC2_SERVER_RAW=$(fm_backend_oc2_server_ensure) || {
+    echo "error: cannot start opencode2 server for $ID" >&2; exit 1; }
+  OC2_URL=${OC2_SERVER_RAW%%$'\t'*}
+  # OC2_PASSWORD stored implicitly in state/.oc2-server (fm_backend_oc2_server_ensure
+  # writes it there; the oc2 API CLI reads it from the XDG service.json).
+
+  # Create the session.
+  OC2_SID=$(fm_backend_oc2_session_create "$WT" "$oc2_model_id" "$oc2_provider" "$oc2_variant") || {
+    echo "error: opencode2 session.create failed for $ID" >&2; exit 1; }
+  [ -n "$OC2_SID" ] || { echo "error: opencode2 session.create returned empty session id for $ID" >&2; exit 1; }
+
+  # Submit the brief as the session's initial prompt.
+  fm_backend_oc2_prompt_file "$OC2_SID" "$BRIEF" || {
+    echo "error: opencode2 session.prompt (brief) failed for $ID (session $OC2_SID)" >&2; exit 1; }
+
+  # Resolve delivery mode + yolo.
+  PROJ_NAME=$(basename "$PROJ_ABS")
+  read -r MODE YOLO <<EOF
+$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
+EOF
+
+  T="oc2:$OC2_SID"
+  mkdir -p "$STATE"
+  {
+    echo "window=$T"
+    echo "worktree=$WT"
+    echo "project=$PROJ_ABS"
+    echo "harness=$HARNESS"
+    echo "kind=$KIND"
+    echo "mode=$MODE"
+    echo "yolo=$YOLO"
+    echo "tasktmp=$TASK_TMP"
+    echo "model=${MODEL:-default}"
+    echo "effort=${EFFORT:-default}"
+    echo "backend=oc2"
+    echo "oc2_url=$OC2_URL"
+    echo "oc2_session=$OC2_SID"
+  } > "$STATE/$ID.meta"
+
+  echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$T worktree=$WT"
+  exit 0
+fi
 
 W="fm-$ID"
 case "$BACKEND" in

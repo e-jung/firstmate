@@ -86,6 +86,7 @@ The supported launch-profile flags below are verified locally; each row records 
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high>` | Verified on grok 0.2.99 (2026-07-13). `--effort` is an alias, but firstmate's profile axis is reasoning effort. As of 0.2.99 the ceiling is `high`; both `xhigh` and `max` are rejected with `use one of: high, medium, low`, so firstmate omits them. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on pi 0.80.2. `max` prints an invalid-thinking warning, so firstmate omits Pi effort when the requested effort is `max`. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
+| opencode2 | `--model <provider/model>` | `--effort <low\|medium\|high\|xhigh\|max>` (maps to variant) | Verified on opencode-ai@0.0.0-next-202606270058 (binary `opencode2`). Model split into `{id, providerID}` at session.create; effort maps to `variant`: max->max, xhigh/high->high, medium->medium, low->default. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
@@ -265,3 +266,38 @@ The adapter therefore runs the shared predicate and, when it returns 2, forces o
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.
+
+## opencode2 (VERIFIED 2026-07-14, opencode-ai@0.0.0-next-202606270058)
+
+OpenCode v2, driven over its HTTP API.
+Unlike every pane-based harness, an opencode2 crewmate has NO terminal pane: it is a server session addressed by `oc2:<session-id>`.
+Launch, steer, interrupt, peek, and turn-end detection are all API calls.
+The `oc2` pseudo-backend (`bin/backends/oc2.sh`) implements the primitives; `--harness opencode2` forces `backend=oc2` in `fm-spawn.sh`.
+v1 opencode stays the fleet default; opencode2 is reached only via the explicit flag.
+
+| Fact | Value |
+|---|---|
+| Busy signature | `v2.session.active` API state (session present = busy; absent = idle). No pane regex. |
+| Turn-end signal | `scan_oc2_turn_ends` in `fm-watch.sh` polls `v2.session.active` every cycle; touches `state/<id>.turn-ended` on busy->idle transition. No plugin, no pane hook. |
+| Exit / interrupt | `v2.session.interrupt` via `fm-send.sh <target> --key Escape` |
+| Steer (resume) | `fm-send.sh <target> <text>` submits a new `v2.session.prompt` on the same sessionID (sessions are persistent server-side; no `--continue` flag). |
+| Peek | `fm-peek.sh <target>` reads `v2.session.messages` (assistant messages carry `content[].text`; user messages carry `text` directly). |
+| Skill invocation | natural language (steer via `fm-send`); no verified slash-command invocation path |
+
+**Auth transfer (spike §1.2):** v2 does not read v1's `auth.json`.
+The GLM API key is surfaced read-only as `ZHIPU_API_KEY`, extracted from the v1 credential file at `~/.local/share/opencode/auth.json` (the `zai-coding-plan.key` field).
+The original file is never modified.
+`fm_backend_oc2_server_ensure` starts the managed server with `ZHIPU_API_KEY` in its env so the provider is available.
+
+**Isolation model (spike §5):** one shared opencode2 server per firstmate home, N sessions.
+The server is session-centric: concurrent sessions are isolated by sessionID (verified).
+All v2 state (`opencode-next.db`, `service.json`) lives in `$FM_HOME/state/.oc2/` (gitignored), NEVER in the live v1 `~/.local/share/opencode/`.
+The v1 `opencode.db` is never opened, migrated, or written.
+
+**Binary safety rail (spike §0):** `npm i -g opencode-ai@next` silently removes the global v1 `opencode` binary.
+firstmate obtains `opencode2` via an isolated npm prefix (e.g. `npm install --prefix ~/.local/share/oc2-prefix opencode-ai@next`), symlinked to `~/.local/bin/opencode2`.
+Set `FM_OPENCODE2_BIN` to override the binary path.
+
+**Known gap:** `v2.session.wait` is stubbed ("not available yet") in this build.
+Not a blocker: the poll-based turn-end detection (`scan_oc2_turn_ends`) is the correct shape for firstmate's event-driven watcher anyway.
+The SSE event stream (`GET /api/session/{id}/event?after=<seq>`) is an alternative turn-end source but is not used by the current adapter; the `v2.session.active` poll is simpler and sufficient.

@@ -406,6 +406,41 @@ scan_signals() {
   return 0
 }
 
+# scan_oc2_turn_ends: poll every opencode2 task's session for busy->idle
+# transitions and touch state/<id>.turn-ended when a turn completes. This is
+# the API-native replacement for the v1 pane turn-end plugin: the watcher asks
+# the server `v2.session.active` (one call for all sessions) and fires a
+# turn-end signal exactly when a session that was busy on the previous poll is
+# now idle. Per-task busy state is tracked in .oc2-busy-<id> so transitions
+# survive watcher restarts. Idempotent and read-only aside from touching the
+# turn-ended file and the busy marker.
+scan_oc2_turn_ends() {
+  local meta id sid active was_busy is_busy
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    grep -q '^backend=oc2$' "$meta" 2>/dev/null || continue
+    id=$(basename "$meta" .meta)
+    sid=$(grep '^oc2_session=' "$meta" | cut -d= -f2- || true)
+    [ -n "$sid" ] || continue
+    # Lazy-source the oc2 backend (no-op if already sourced).
+    fm_backend_source oc2 >/dev/null 2>&1 || continue
+    active=$(fm_backend_oc2_active_raw 2>/dev/null || printf '{"data":{}}')
+    if printf '%s' "$active" | grep -q "\"$sid\"" 2>/dev/null; then
+      is_busy=1
+    else
+      is_busy=0
+    fi
+    if [ -f "$STATE/.oc2-busy-$id" ]; then was_busy=1; else was_busy=0; fi
+    if [ "$was_busy" = 1 ] && [ "$is_busy" = 0 ]; then
+      touch "$STATE/$id.turn-ended"
+      rm -f "$STATE/.oc2-busy-$id"
+    elif [ "$is_busy" = 1 ]; then
+      : > "$STATE/.oc2-busy-$id"
+    fi
+  done
+  return 0
+}
+
 run_check() {
   local c=$1
   if command -v timeout >/dev/null 2>&1; then
@@ -647,6 +682,12 @@ while :; do
     touch "$STATE/.last-check"
   fi
 
+  # opencode2 turn-end detection: poll v2.session.active for busy->idle
+  # transitions and touch state/<id>.turn-ended when a turn completes. Runs
+  # BEFORE scan_signals so the touched turn-ended file is picked up by the
+  # same signal scan below. No-op when no oc2 tasks exist.
+  scan_oc2_turn_ends
+
   # On the first changed signal, linger one grace period and re-scan before
   # classifying: a crewmate's final status write and the same turn's turn-end
   # hook land seconds apart, and reporting them as separate actionable wakes
@@ -721,6 +762,9 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
+    # oc2 tasks have no pane; turn-end is detected via scan_oc2_turn_ends above,
+    # not via pane-hash staleness. Skip them here to avoid futile API captures.
+    [ "$(window_backend "$w")" = oc2 ] && continue
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
