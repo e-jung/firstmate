@@ -1013,14 +1013,29 @@ secondmate_current_json() {  # <parent-tasks-json>
       esac
     fi
     if [ -z "$reason" ]; then
-      if ! validate_secondmate_home "$id" "$home" 2>/dev/null; then
-        reason="invalid home: $VALIDATION_ERROR"
+      validate_out=$(FM_HOME="$FM_HOME" FM_ROOT="$FM_ROOT" run_timed \
+        "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" bash -c '
+          . "$1"
+          if validate_secondmate_home "$2" "$3"; then
+            printf "%s" "$VALIDATED_HOME"
+            exit 0
+          fi
+          printf "%s" "$VALIDATION_ERROR"
+          exit 1
+        ' validate-secondmate "$SCRIPT_DIR/fm-ff-lib.sh" "$id" "$home" 2>/dev/null)
+      validate_rc=$?
+      if [ "$validate_rc" -eq 124 ]; then
+        reason="invalid home: validation timed out"
+      elif [ "$validate_rc" -ne 0 ]; then
+        reason="invalid home: ${validate_out:-validation failed}"
       else
-        home=$VALIDATED_HOME
-        case " $seen_homes " in
-          *" $home "*) reason="invalid home: duplicate resolved home route" ;;
-          *) seen_homes="$seen_homes $home" ;;
-        esac
+        home=$validate_out
+        VALIDATED_HOME=$home
+        if [ -n "$seen_homes" ] && printf '%s\n' "$seen_homes" | grep -qxF -- "$home"; then
+          reason="invalid home: duplicate resolved home route"
+        else
+          seen_homes=$(printf '%s\n%s' "$seen_homes" "$home")
+        fi
       fi
     fi
     if [ -z "$reason" ]; then
