@@ -120,6 +120,7 @@ Firstmate launches every claude crewmate and secondmate with `CLAUDE_CODE_ENABLE
 The CLI's `--prompt-suggestions` flag is print/SDK-mode only and does not suppress the interactive composer ghost text, verified empirically on v2.1.186.
 As defense in depth for any pane that flag cannot reach, including the captain's own firstmate composer that away-mode reads, the shared `fm_composer_strip_ghost` extractor in `bin/fm-composer-lib.sh` removes dim/faint SGR 2 ghost runs before pending-input classification on both ANSI-capable readers (tmux and herdr).
 Its broader dark-TRUECOLOR placeholder handling and dark-theme tradeoff are documented in `docs/herdr-backend.md`'s 2026-07-10 incident record.
+Separately, claude 2.1.x pads its idle-empty composer prompt row with a non-breaking space (`❯ `, U+00A0) rather than an ASCII space; `fm_composer_classify_content` normalizes U+00A0 so that idle row reads `empty`, not `pending` (the 2026-07-14 away-mode wedge; see `docs/herdr-backend.md`'s 2026-07-14 incident record).
 That styled capture is internal to the boolean detector only.
 `fm-peek` and every other human or LLM-facing capture path stays plain `tmux capture-pane` with no escape codes.
 

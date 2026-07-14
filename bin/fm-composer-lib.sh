@@ -180,8 +180,21 @@ fm_composer_idle_matches() {
 }
 
 fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [plain_content]
-  local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content
+  local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content nbsp
   plain_content=${5:-$content}
+  # Normalize the non-breaking space (U+00A0, bytes C2 A0) to an ordinary space.
+  # Some harnesses PAD an otherwise-empty composer with it - claude 2.1.x renders
+  # its idle prompt row as "❯ " (verified read-only from a live wedged
+  # primary claude-on-herdr pane, docs/herdr-backend.md 2026-07-14 incident). U+00A0
+  # is NOT in the ASCII [:space:] class the emptiness trims below use, so without
+  # this an idle-empty composer whose only remaining content is that pad trims to a
+  # lone U+00A0 after the prompt glyph is stripped and misreads as 'pending' real
+  # input, deferring away-mode injection forever. Real typed text keeps its own
+  # non-whitespace bytes, so it still reads 'pending'; whitespace-only input already
+  # read 'empty' with an ASCII space, and this only extends that to U+00A0.
+  nbsp=$'\xc2\xa0'
+  content=${content//"$nbsp"/ }
+  plain_content=${plain_content//"$nbsp"/ }
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;

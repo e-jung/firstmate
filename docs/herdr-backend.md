@@ -708,6 +708,40 @@ The luminance rule assumes a dark terminal theme (the fleet reality); the SGR-2 
 **Resolved: backend-independent wedge alarm.** The max-defer wedge alarm (`inject_wedge_alarm`, `bin/fm-supervise-daemon.sh`) formerly alarmed into the void because its only active signal was a tmux client status-line flash, skipped for herdr, leaving only the passive `state/.subsuper-inject-wedged` marker.
 It now also attempts a configurable active alert independent of the supervisor backend; [`wedge-alarm.md`](wedge-alarm.md) owns its channels and verification evidence.
 
+## Incident (2026-07-14): away-mode injection wedged on the primary claude composer's non-breaking-space pad
+
+The captain found away-mode had never injected: the sub-supervisor daemon deferred every escalation and eventually wrote `state/.subsuper-inject-wedged`, while its own target resolution was correct (`FM_SUPERVISOR_TARGET=default:wB:p1`, the firstmate primary's herdr pane).
+The daemon log (`state/.supervise-daemon.log`) repeated on nearly every housekeeping tick:
+
+```
+inject deferred: supervisor composer not confirmed-empty (state=pending: pending input, dead-shell prompt, or unreadable pane)
+```
+
+The `state=pending` verdict means the shared classifier read the idle-empty primary composer as holding unsubmitted text, so `inject_msg`'s "inject only into an affirmatively-`empty` composer" guard deferred forever - the away-mode LLM was never woken and every hand-off stalled until the captain manually poked it.
+
+**Root cause.** claude 2.1.208 pads its idle-empty composer prompt row with a NON-BREAKING SPACE (U+00A0, bytes `C2 A0`), not an ASCII space.
+Captured read-only from the live wedged primary claude-on-herdr pane `default:wB:p1` on 2026-07-14 (no Herdr lifecycle touched):
+
+```
+$ herdr --session default pane read wB:p1 --source recent --lines 30 --format ansi | cat -v
+^[[0m^[[38;5;246mM-bM-^]M-/M-BM-  ^[[0m       # \033[0m\033[38;5;246m❯\302\240 \033[0m  ->  "❯" + U+00A0 + space
+```
+
+The shared classifier (`fm_composer_classify_content`, `bin/fm-composer-lib.sh`) strips the leading prompt glyph and then judges emptiness by trimming the ASCII `[:space:]` class only.
+U+00A0 is not in that class, so after the `❯` glyph is stripped a lone U+00A0 remained and read as real `pending` input.
+The `❯` glyph's 256-colour `38;5;246` styling was NOT the cause - `fm_composer_strip_ghost` correctly keeps a 256-colour foreground (it is palette-dependent, never used for ghost text), so the glyph is kept and correctly recognized; the U+00A0 pad alone was decisive.
+This affects every backend that routes through the shared owner (the same U+00A0 pad appears on the tmux path too), not just herdr.
+
+**Reproduction (deterministic, from the exact captured bytes).**
+Feeding the live composer row through the real `fm_backend_herdr_composer_state` (via the fake-`herdr` capture harness) returned `pending` before the fix and `empty` after, and the direct classifier returned `pending`/`empty` on `❯\302\240` for the same reason.
+
+**Fix (task fm-inject-wedge-fix).** `fm_composer_classify_content` now normalizes U+00A0 to an ordinary space before its emptiness trims, so an idle-empty composer padded with U+00A0 reads `empty` (safe to inject).
+The change is surgical: real typed text keeps its own non-whitespace bytes and still reads `pending` (with or without a leading U+00A0 pad), a bare shell prompt still reads `unknown`, and whitespace-only input - which already read `empty` with an ASCII space - now reads `empty` with U+00A0 too.
+
+**Regression coverage.** `tests/fm-composer-lib.test.sh`'s `test_nbsp_padded_composer_is_empty` pins the shared owner directly (U+00A0-padded idle -> `empty`, U+00A0-only -> `empty`, real text after a U+00A0 pad -> `pending`).
+`tests/fm-backend-herdr.test.sh` feeds the exact captured live bytes through the real reader: `test_composer_state_claude_nbsp_padded_idle_is_empty` (`empty`) and `test_composer_state_claude_nbsp_row_with_real_text_is_pending` (`pending`).
+`bin/fm-lint.sh` passes clean.
+
 ## Native `pane.agent_status_changed` push escalation (immediate blocked wake)
 
 Herdr exposes a native, push-based agent-state event stream, and firstmate folds it into the watcher so a crew entering `blocked` (waiting on the human at a permission/trust dialog, an interactive menu, or a wedged prompt) wakes its supervisor sub-second instead of after the ~240s stale-pane wedge timer.

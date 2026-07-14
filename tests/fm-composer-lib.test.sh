@@ -114,6 +114,28 @@ test_idle_placeholder_case_mode_is_explicit() {
   pass "fm_composer_classify_content: idle matching preserves the caller's case mode"
 }
 
+# --- Non-breaking-space (U+00A0) composer padding reads empty ---------------
+# THE 2026-07-14 away-mode wedge: claude 2.1.x pads its idle-empty composer row
+# with a non-breaking space ("❯ "), not an ASCII space. U+00A0 is not in the
+# ASCII [:space:] class the emptiness trims use, so before the fix a lone U+00A0
+# left after the prompt glyph was stripped read as `pending` real input and
+# deferred away-mode injection forever. The fix normalizes U+00A0 to a space so an
+# idle-empty composer reads `empty`, while real typed text (with or without a
+# leading U+00A0) still reads `pending`.
+test_nbsp_padded_composer_is_empty() {
+  local nbsp out
+  nbsp=$(printf '\xc2\xa0')
+  # bare claude idle composer: agent glyph + U+00A0 pad, nothing typed.
+  out=$(classify 0 "❯${nbsp}"); [ "$out" = empty ] || fail "an idle '❯'+U+00A0 composer must read empty, got '$out'"
+  # bordered idle composer padded with U+00A0.
+  out=$(classify 1 ">${nbsp}"); [ "$out" = empty ] || fail "an idle bordered '>'+U+00A0 composer must read empty, got '$out'"
+  # U+00A0-only content (all padding, no glyph) is still empty.
+  out=$(classify 1 "${nbsp}"); [ "$out" = empty ] || fail "a U+00A0-only composer must read empty, got '$out'"
+  # SAFETY: real typed text after a U+00A0 pad must still read pending.
+  out=$(classify 0 "❯${nbsp}land pr 416 now"); [ "$out" = pending ] || fail "real text after a U+00A0 pad must stay pending, got '$out'"
+  pass "fm_composer_classify_content: a U+00A0-padded idle composer reads empty, real text after U+00A0 stays pending (2026-07-14 wedge)"
+}
+
 # --- Real text is pending ---------------------------------------------------
 
 test_real_text_is_pending() {
@@ -133,4 +155,5 @@ test_agent_glyphs_are_empty_bordered_and_bare
 test_empty_content_is_empty
 test_idle_placeholder_is_empty
 test_idle_placeholder_case_mode_is_explicit
+test_nbsp_padded_composer_is_empty
 test_real_text_is_pending

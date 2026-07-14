@@ -1015,6 +1015,41 @@ test_composer_state_grok_bright_truecolor_real_text_is_pending() {
   pass "fm_backend_herdr_composer_state: grok's real bright typed input still reads pending"
 }
 
+# THE 2026-07-14 away-mode wedge (task fm-inject-wedge-fix). Captured read-only
+# from the live wedged primary claude-on-herdr pane default:wB:p1 on 2026-07-14:
+# claude 2.1.208 renders its idle-empty composer prompt row as
+# "\x1b[0m\x1b[38;5;246m❯\xc2\xa0 \x1b[0m" - the "❯" glyph followed by a
+# NON-BREAKING SPACE (U+00A0, bytes C2 A0) pad, not an ASCII space. herdr's
+# `pane read --format ansi` preserves it. The shared classifier only trimmed the
+# ASCII [:space:] class, so after the "❯" glyph was stripped a lone U+00A0
+# remained and read as real `pending` input - the daemon deferred EVERY away-mode
+# injection ("supervisor composer not confirmed-empty (state=pending...)"),
+# wedging away-mode all night. The fix normalizes U+00A0 to a space in the shared
+# owner so the row reads empty (safe to inject).
+test_composer_state_claude_nbsp_padded_idle_is_empty() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-claude-nbsp-idle"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\xe2\x9c\xbb Brewed for 2s\n\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n\x1b[0m\x1b[38;5;246m\xe2\x9d\xaf\xc2\xa0 \x1b[0m\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n  Opus 4.8   95%%\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:wB:p1' "$ROOT" )
+  [ "$out" = empty ] || fail "the 2026-07-14 wedge shape - claude's idle '❯' + U+00A0 pad - must read empty, got '$out' (regression: this false-pending wedged away-mode injection)"
+  pass "fm_backend_herdr_composer_state: claude's U+00A0-padded idle composer (the 2026-07-14 wedge shape) reads empty"
+}
+
+# The same idle prompt row, but with REAL typed text after the U+00A0 pad, must
+# still read pending so the fix never weakens captain-input protection.
+test_composer_state_claude_nbsp_row_with_real_text_is_pending() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-claude-nbsp-real"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n\x1b[0m\x1b[38;5;246m\xe2\x9d\xaf\xc2\xa0land pr 416 now\x1b[0m\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:wB:p1' "$ROOT" )
+  [ "$out" = pending ] || fail "real typed text after a U+00A0 pad must still read pending, got '$out'"
+  pass "fm_backend_herdr_composer_state: real typed text after a U+00A0 pad still reads pending"
+}
+
 test_composer_state_codex_bare_prompt_glyph_is_empty() {
   local dir log resp fb out
   dir="$TMP_ROOT/composer-codex-bare"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2027,6 +2062,8 @@ test_composer_state_claude_dim_prompt_suggestion_ghost_is_empty
 test_composer_state_claude_dim_ghost_row_with_real_text_is_pending
 test_composer_state_grok_dark_truecolor_placeholder_is_empty
 test_composer_state_grok_bright_truecolor_real_text_is_pending
+test_composer_state_claude_nbsp_padded_idle_is_empty
+test_composer_state_claude_nbsp_row_with_real_text_is_pending
 test_composer_state_codex_bare_prompt_glyph_is_empty
 test_composer_state_codex_faint_suggestion_is_empty
 test_composer_state_codex_non_faint_same_text_is_pending
