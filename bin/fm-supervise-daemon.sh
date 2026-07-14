@@ -405,7 +405,7 @@ classify_stale() {  # <window> <state>
   printf 'self|transient stale (%s): %s' "$win" "${last:-no status}"
 }
 
-classify_check() {  # <full reason>  — check scripts print only when firstmate should wake
+classify_check() {  # <full reason>  — the watcher emits a check wake only for a real change or swallowed transition
   printf 'escalate|%s' "$1"
 }
 

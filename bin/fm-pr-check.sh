@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Record a PR-ready task: appends pr=<url> and GitHub's pr_head=<sha> to
 # state/<id>.meta when available, then arms the watcher's merge poll by writing
-# state/<id>.check.sh, which prints one line iff the PR is merged (the watcher's
-# check contract: output = wake firstmate, silence = keep sleeping).
+# state/<id>.check.sh, an idempotent check that prints "merged" once the PR is
+# merged; the watcher dedups steady-state output so it wakes once on the merge.
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 
