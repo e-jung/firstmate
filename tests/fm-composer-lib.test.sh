@@ -133,7 +133,15 @@ test_nbsp_padded_composer_is_empty() {
   out=$(classify 1 "${nbsp}"); [ "$out" = empty ] || fail "a U+00A0-only composer must read empty, got '$out'"
   # SAFETY: real typed text after a U+00A0 pad must still read pending.
   out=$(classify 0 "❯${nbsp}land pr 416 now"); [ "$out" = pending ] || fail "real text after a U+00A0 pad must stay pending, got '$out'"
-  pass "fm_composer_classify_content: a U+00A0-padded idle composer reads empty, real text after U+00A0 stays pending (2026-07-14 wedge)"
+  # SAFETY: a BARE shell prompt glyph padded with U+00A0 must read unknown (a
+  # dead shell, never a safe injection target), not empty. The pad must collapse
+  # back to the lone glyph and reach the shell-glyph exact-match branch.
+  for g in '>' '$' '%' '#'; do
+    out=$(classify 0 "${g}${nbsp}")
+    [ "$out" = unknown ] \
+      || fail "a bare shell glyph '$g'+U+00A0 must read unknown (dead shell), got '$out'"
+  done
+  pass "fm_composer_classify_content: a U+00A0-padded idle composer reads empty, real text after U+00A0 stays pending, a bare U+00A0-padded shell glyph stays unknown (2026-07-14 wedge)"
 }
 
 # --- Real text is pending ---------------------------------------------------

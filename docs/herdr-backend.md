@@ -738,7 +738,7 @@ Feeding the live composer row through the real `fm_backend_herdr_composer_state`
 **Fix (task fm-inject-wedge-fix).** `fm_composer_classify_content` now normalizes U+00A0 to an ordinary space before its emptiness trims, so an idle-empty composer padded with U+00A0 reads `empty` (safe to inject).
 The change is surgical: real typed text keeps its own non-whitespace bytes and still reads `pending` (with or without a leading U+00A0 pad), a bare shell prompt still reads `unknown`, and whitespace-only input - which already read `empty` with an ASCII space - now reads `empty` with U+00A0 too.
 
-**Regression coverage.** `tests/fm-composer-lib.test.sh`'s `test_nbsp_padded_composer_is_empty` pins the shared owner directly (U+00A0-padded idle -> `empty`, U+00A0-only -> `empty`, real text after a U+00A0 pad -> `pending`).
+**Regression coverage.** `tests/fm-composer-lib.test.sh`'s `test_nbsp_padded_composer_is_empty` pins the shared owner directly (U+00A0-padded idle -> `empty`, U+00A0-only -> `empty`, real text after a U+00A0 pad -> `pending`, bare U+00A0-padded shell glyph -> `unknown`).
 `tests/fm-backend-herdr.test.sh` feeds the exact captured live bytes through the real reader: `test_composer_state_claude_nbsp_padded_idle_is_empty` (`empty`) and `test_composer_state_claude_nbsp_row_with_real_text_is_pending` (`pending`).
 `bin/fm-lint.sh` passes clean.
 

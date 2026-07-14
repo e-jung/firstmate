@@ -195,6 +195,10 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   nbsp=$'\xc2\xa0'
   content=${content//"$nbsp"/ }
   plain_content=${plain_content//"$nbsp"/ }
+  content="${content#"${content%%[![:space:]]*}"}"
+  content="${content%"${content##*[![:space:]]}"}"
+  plain_content="${plain_content#"${plain_content%%[![:space:]]*}"}"
+  plain_content="${plain_content%"${plain_content##*[![:space:]]}"}"
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;
