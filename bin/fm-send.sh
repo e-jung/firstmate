@@ -246,6 +246,12 @@ else
       exit 1
       ;;
   esac
+  if [ "$TARGET_BACKEND" = oc2 ] && [ -n "$TARGET_META" ]; then
+    _oc2_id=$(fm_send_id_from_meta "$TARGET_META")
+    if [ -n "$_oc2_id" ]; then
+      : > "$STATE/.oc2-busy-$_oc2_id"
+    fi
+  fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the
   # turn before its busy footer shows. Pause so an immediate peek catches the

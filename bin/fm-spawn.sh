@@ -805,6 +805,7 @@ EOF
 
   T="oc2:$OC2_SID"
   mkdir -p "$STATE"
+  : > "$STATE/.oc2-busy-$ID"
   {
     echo "window=$T"
     echo "worktree=$WT"
