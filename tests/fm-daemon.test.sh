@@ -1511,6 +1511,42 @@ test_defer_streak_resets_on_busy_pane() {
   pass "a busy-pane defer (healthy) resets the streak without alarming"
 }
 
+# handle_wake's batching-disabled (FM_ESCALATE_BATCH_SECS<=0) immediate flush is
+# routed through _flush_and_observe, not raw escalate_flush, so the in-flight
+# classify-time flush feeds the streak tracker exactly like housekeeping: a defer
+# (composer pending) increments the streak and a confirmed delivery resets it.
+# Distinct status lines per call avoid classify_signal's seen-marker dedup.
+test_defer_streak_resets_on_handle_wake_flush() {
+  local dir state fakebin sent capture status line
+  dir=$(make_supercase defer-streak-handlewake)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; printf 'human draft text\n' > "$capture"
+  status="$state/hw.status"
+  afk_enter "$state"
+  for line in "done: PR A" "done: PR B"; do
+    printf '%s\n' "$line" > "$status"
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" \
+      FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+      FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+      FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+      FM_DEFER_STREAK_MAX=3 handle_wake "signal: $status" "$state"
+  done
+  [ "$(cat "$state/.subsuper-defer-streak" 2>/dev/null || echo 0)" = "2" ] \
+    || fail "streak should be 2 after two handle_wake defers: $(cat "$state/.subsuper-defer-streak" 2>/dev/null || echo none)"
+  # A confirmed delivery on the third handle_wake flush resets the streak.
+  printf 'done: PR C\n' > "$status"
+  printf '│ > │\n' > "$capture"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" \
+    FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=0 FM_CANARY_INTERVAL_SECS=0 \
+    FM_DEFER_STREAK_MAX=3 FM_INJECT_CONFIRM_SLEEP=0.05 handle_wake "signal: $status" "$state"
+  [ ! -e "$state/.subsuper-defer-streak" ] || fail "handle_wake flush did not reset the streak on a confirmed delivery"
+  [ ! -e "$state/.subsuper-defer-streak-fired" ] || fail "handle_wake flush did not clear the fired sentinel on delivery"
+  pass "handle_wake's immediate flush feeds the streak tracker (increments on defer, resets on delivery)"
+}
+
 test_defer_streak_disabled_and_noop_when_afk_off() {
   local dir state fakebin sent capture
   dir=$(make_supercase defer-streak-afk-off)
@@ -2031,6 +2067,7 @@ test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
 test_defer_streak_fires_at_threshold
 test_defer_streak_resets_on_successful_delivery
 test_defer_streak_resets_on_busy_pane
+test_defer_streak_resets_on_handle_wake_flush
 test_defer_streak_disabled_and_noop_when_afk_off
 test_defer_streak_disabled_when_threshold_zero
 test_defer_streak_dedupes_with_max_defer_within_window
