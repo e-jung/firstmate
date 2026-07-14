@@ -1040,7 +1040,7 @@ _flush_and_observe() {  # <state>
 # disables. Implementation-blind: it catches a broken path regardless of WHY
 # (the next composer misclassification, a phantom target, a swallowed class).
 wake_canary() {  # <state>
-  local state=$1 interval target backend bs composer verdict age
+  local state=$1 interval target backend composer verdict age
   afk_active "$state" || return 0
   interval=${FM_CANARY_INTERVAL_SECS:-$CANARY_INTERVAL_SECS_DEFAULT}
   [ "$interval" -gt 0 ] || return 0
@@ -1050,25 +1050,18 @@ wake_canary() {  # <state>
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   if ! fm_backend_target_exists "$backend" "$target"; then
     verdict="broken: supervisor target gone"
+  elif pane_is_busy "$target" "$backend"; then
+    # A busy pane is a legitimate defer (agent mid-turn). pane_is_busy checks the
+    # native busy-state primitive first, then the capture+regex fallback (tmux has
+    # no native busy primitive), so a tmux busy footer reads healthy here exactly
+    # as inject_msg's guard would.
+    verdict="healthy: pane busy (legitimate defer)"
   else
-    bs=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)
-    case "$bs" in
-      busy) verdict="healthy: pane busy (legitimate defer)" ;;
-      *)
-        # Corroborate via the capture+regex fallback pane_is_busy uses (tmux has
-        # no native busy primitive), so a tmux primary's busy footer still reads
-        # healthy here exactly as inject_msg's guard would.
-        if pane_is_busy "$target" "$backend"; then
-          verdict="healthy: pane busy (legitimate defer)"
-        else
-          composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
-          case "$composer" in
-            empty) verdict="healthy: composer empty (inject would land)" ;;
-            pending) verdict="broken: idle pane, composer pending (classifier wedge)" ;;
-            *) verdict="broken: idle pane, composer ${composer:-unknown} (dead shell / unreadable)" ;;
-          esac
-        fi
-        ;;
+    composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
+    case "$composer" in
+      empty) verdict="healthy: composer empty (inject would land)" ;;
+      pending) verdict="broken: idle pane, composer pending (classifier wedge)" ;;
+      *) verdict="broken: idle pane, composer ${composer:-unknown} (dead shell / unreadable)" ;;
     esac
   fi
   case "$verdict" in
