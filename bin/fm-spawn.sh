@@ -190,6 +190,9 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+OC2_ABORT_CLEANUP=0
+OC2_ABORT_WT=
+OC2_ABORT_SID=
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -239,7 +242,27 @@ orca_spawn_abort_cleanup() {
   fi
   return "$status"
 }
-trap orca_spawn_abort_cleanup EXIT
+
+oc2_spawn_abort_cleanup() {
+  local status=$?
+  [ "$OC2_ABORT_CLEANUP" = 1 ] || return "$status"
+  OC2_ABORT_CLEANUP=0
+  if [ -n "${OC2_ABORT_SID:-}" ]; then
+    fm_backend_kill oc2 "oc2:$OC2_ABORT_SID" 2>/dev/null || true
+  fi
+  if [ -n "${OC2_ABORT_WT:-}" ] && [ -n "${PROJ_ABS:-}" ]; then
+    ( cd "$PROJ_ABS" && treehouse return --force "$OC2_ABORT_WT" ) 2>/dev/null || true
+  fi
+  return "$status"
+}
+
+spawn_abort_cleanup() {
+  local status=$?
+  orca_spawn_abort_cleanup || true
+  oc2_spawn_abort_cleanup || true
+  return "$status"
+}
+trap spawn_abort_cleanup EXIT
 
 # Batch dispatch (see header): when the first positional is an `id=repo` pair, treat every
 # positional as one and spawn each by re-execing this script in single-task mode. We use
@@ -749,6 +772,8 @@ if [ "$BACKEND" = oc2 ]; then
   WT=$(cd "$PROJ_ABS" && treehouse get --lease --lease-holder "fm-$ID" 2>/dev/null) || {
     echo "error: treehouse get --lease failed for $ID in $PROJ_ABS" >&2; exit 1; }
   [ -n "$WT" ] || { echo "error: treehouse get --lease returned empty path for $ID" >&2; exit 1; }
+  OC2_ABORT_WT=$WT
+  OC2_ABORT_CLEANUP=1
   validate_spawn_worktree "treehouse get --lease" "oc2 session"
 
   # Per-task temp root (same as pane-based tasks; fm-teardown removes it).
@@ -766,6 +791,7 @@ if [ "$BACKEND" = oc2 ]; then
   OC2_SID=$(fm_backend_oc2_session_create "$WT" "$oc2_model_id" "$oc2_provider" "$oc2_variant") || {
     echo "error: opencode2 session.create failed for $ID" >&2; exit 1; }
   [ -n "$OC2_SID" ] || { echo "error: opencode2 session.create returned empty session id for $ID" >&2; exit 1; }
+  OC2_ABORT_SID=$OC2_SID
 
   # Submit the brief as the session's initial prompt.
   fm_backend_oc2_prompt_file "$OC2_SID" "$BRIEF" || {
@@ -796,6 +822,7 @@ EOF
   } > "$STATE/$ID.meta"
 
   echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$T worktree=$WT"
+  OC2_ABORT_CLEANUP=0
   exit 0
 fi
 
