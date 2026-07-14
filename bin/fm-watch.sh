@@ -415,16 +415,25 @@ scan_signals() {
 # survive watcher restarts. Idempotent and read-only aside from touching the
 # turn-ended file and the busy marker.
 scan_oc2_turn_ends() {
-  local meta id sid active was_busy is_busy
+  local meta id sid active was_busy is_busy have_oc2=0
+  # Detect whether any oc2 task exists before making the shared API call.
+  for meta in "$STATE"/*.meta; do
+    if [ -e "$meta" ] && grep -q '^backend=oc2$' "$meta" 2>/dev/null; then
+      have_oc2=1
+      break
+    fi
+  done
+  [ "$have_oc2" = 1 ] || return 0
+  # v2.session.active returns ALL active sessions in one response; call once
+  # and reuse the result for every oc2 task (avoids N identical calls per cycle).
+  fm_backend_source oc2 >/dev/null 2>&1 || return 0
+  active=$(fm_backend_oc2_active_raw 2>/dev/null || printf '{"data":{}}')
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     grep -q '^backend=oc2$' "$meta" 2>/dev/null || continue
     id=$(basename "$meta" .meta)
     sid=$(grep '^oc2_session=' "$meta" | cut -d= -f2- || true)
     [ -n "$sid" ] || continue
-    # Lazy-source the oc2 backend (no-op if already sourced).
-    fm_backend_source oc2 >/dev/null 2>&1 || continue
-    active=$(fm_backend_oc2_active_raw 2>/dev/null || printf '{"data":{}}')
     if printf '%s' "$active" | grep -q "\"$sid\"" 2>/dev/null; then
       is_busy=1
     else

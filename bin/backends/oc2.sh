@@ -161,12 +161,22 @@ fm_backend_oc2_api() {
 # Prints the sessionID (ses_...) to stdout.
 fm_backend_oc2_session_create() {
   local dir=$1 model_id=$2 provider=$3 variant=$4 body resp
-  if [ -n "$variant" ]; then
-    body=$(printf '{"agent":"build","model":{"id":"%s","providerID":"%s","variant":"%s"},"location":{"directory":"%s"}}' \
-      "$model_id" "$provider" "$variant" "$dir")
+  if command -v jq >/dev/null 2>&1; then
+    if [ -n "$variant" ]; then
+      body=$(jq -nc --arg m "$model_id" --arg p "$provider" --arg v "$variant" --arg d "$dir" \
+        '{"agent":"build","model":{"id":$m,"providerID":$p,"variant":$v},"location":{"directory":$d}}')
+    else
+      body=$(jq -nc --arg m "$model_id" --arg p "$provider" --arg d "$dir" \
+        '{"agent":"build","model":{"id":$m,"providerID":$p},"location":{"directory":$d}}')
+    fi
   else
-    body=$(printf '{"agent":"build","model":{"id":"%s","providerID":"%s"},"location":{"directory":"%s"}}' \
-      "$model_id" "$provider" "$dir")
+    if [ -n "$variant" ]; then
+      body=$(python3 -c "import json,sys; print(json.dumps({'agent':'build','model':{'id':sys.argv[1],'providerID':sys.argv[2],'variant':sys.argv[3]},'location':{'directory':sys.argv[4]}}))" \
+        "$model_id" "$provider" "$variant" "$dir")
+    else
+      body=$(python3 -c "import json,sys; print(json.dumps({'agent':'build','model':{'id':sys.argv[1],'providerID':sys.argv[2]},'location':{'directory':sys.argv[3]}}))" \
+        "$model_id" "$provider" "$dir")
+    fi
   fi
   resp=$(fm_backend_oc2_api v2.session.create -d "$body" 2>&1) || {
     echo "error: opencode2 session.create failed: $resp" >&2; return 1; }
@@ -180,7 +190,11 @@ fm_backend_oc2_session_create() {
 # Submit a prompt to a session. Args: <sessionID> <text>
 fm_backend_oc2_prompt() {
   local sid=$1 text=$2 body
-  body=$(printf '{"prompt":{"text":"%s"}}' "$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')")
+  if command -v jq >/dev/null 2>&1; then
+    body=$(jq -nc --arg t "$text" '{"prompt":{"text":$t}}')
+  else
+    body=$(python3 -c "import json,sys; print(json.dumps({'prompt':{'text':sys.argv[1]}}))" "$text")
+  fi
   fm_backend_oc2_api v2.session.prompt --param "sessionID=$sid" -d "$body" >/dev/null 2>&1
 }
 
