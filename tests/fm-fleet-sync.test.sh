@@ -678,6 +678,10 @@ case "$path" in
     printf '%s\n' "${GH_MERGE_TYPE:-fast-forward}"
     ;;
   */compare/*)
+    comp=${path##*/compare/}; cb=${comp%%...*}; ch=${comp#*...}
+    case "$cb" in *:*) ;; *) printf 'mock gh: compare base must be owner:branch: %s\n' "$comp" >&2; exit 1 ;; esac
+    case "${cb%%:*}" in */*) printf 'mock gh: compare base must be owner:branch, not owner/repo:branch: %s\n' "$comp" >&2; exit 1 ;; esac
+    case "$ch" in *:*) printf 'mock gh: compare head must be the fork bare branch: %s\n' "$comp" >&2; exit 1 ;; esac
     printf '%s\n' "${GH_COMPARE:-behind}"
     ;;
   /repos/*)

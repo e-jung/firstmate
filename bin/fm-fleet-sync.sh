@@ -333,7 +333,7 @@ sync_fork_default() {
   [ "${FM_FORK_SYNC:-1}" != "0" ] || return 0
   command -v gh >/dev/null 2>&1 || return 0
 
-  local bare_repo fork_url owner_repo fork_info rest is_fork parent default
+  local bare_repo fork_url owner_repo fork_info rest is_fork parent parent_owner default
   local compare_status merge_type refspec before after
 
   # Resolve the no-mistakes gate bare repo from the clone's remote.
@@ -358,9 +358,10 @@ sync_fork_default() {
   default=${rest#*$'\t'}
   # Non-fork repos are silently ignored (no gate-fork to sync).
   [ "$is_fork" = "true" ] && [ -n "$parent" ] && [ -n "$default" ] || return 0
+  parent_owner=${parent%%/*}
 
   # Confirm the fork is strictly behind before writing (fast-forward only).
-  compare_status=$(gh api "/repos/$owner_repo/compare/$default...$parent:$default" \
+  compare_status=$(gh api "/repos/$owner_repo/compare/$parent_owner:$default...$default" \
     --jq '.status' 2>/dev/null) || {
     echo "$label: fork-sync: skipped: cannot compare $owner_repo with $parent"
     return 0
