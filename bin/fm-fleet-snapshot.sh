@@ -1009,6 +1009,7 @@ secondmate_current_json() {  # <parent-tasks-json>
       esac
     fi
     if [ -z "$reason" ]; then
+      # shellcheck disable=SC2016 # Positional parameters expand inside the child bash, not here.
       validate_out=$(FM_HOME="$FM_HOME" FM_ROOT="$FM_ROOT" run_timed \
         "$FM_SNAPSHOT_SECONDMATE_TIMEOUT" bash -c '
           . "$1"
