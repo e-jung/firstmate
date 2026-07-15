@@ -709,6 +709,19 @@ add_failing_systemctl() {
   chmod +x "$fakebin/systemctl"
 }
 
+# Fake pgrep reporting two no-mistakes daemons serving one --root (the duplicate
+# condition the pgrep-based check must catch even without systemd).
+add_fake_pgrep_duplicates() {
+  local fakebin=$1
+  cat > "$fakebin/pgrep" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '111 /usr/local/bin/no-mistakes daemon run --root /home/x'
+printf '%s\n' '222 /usr/local/bin/no-mistakes daemon run --root /home/x'
+exit 0
+SH
+  chmod +x "$fakebin/pgrep"
+}
+
 # make_state_home <dir>: lay down an empty FM_HOME shell with state/ + projects/.
 make_state_home() {
   local dir=$1
@@ -771,6 +784,49 @@ test_health_gate_watcher_stale() {
   pass "health gate alerts when the watcher beacon is stale with work in flight"
 }
 
+test_health_gate_detect_only_reports_without_repair() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/hg-detect-only"
+  make_state_home "$case_dir"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_failing_systemctl "$fakebin"
+  : > "$case_dir/home/state/.afk"
+  echo 999999 > "$case_dir/home/state/.supervise-daemon.pid"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh")
+  # The afk-dark problem still surfaces ...
+  case "$out" in
+    *"ALERT: afk is on but the away-mode daemon is not running"*) ;;
+    *) fail "detect-only afk-dark ALERT missing; got: $out" ;;
+  esac
+  # ... but with read-only advisory wording, never a concrete repair directive.
+  case "$out" in
+    *"read-only session"*) ;;
+    *) fail "detect-only ALERT lacks read-only advisory; got: $out" ;;
+  esac
+  case "$out" in
+    *"re-enter /afk"*|*"nohup"*|*"fm-watch-arm.sh"*|*"systemctl --user stop"*|*"kill the stray"*)
+      fail "detect-only ALERT leaked a repair directive: $out" ;;
+  esac
+  pass "health gate reports read-only without repair directives"
+}
+
+test_health_gate_duplicate_daemons_without_systemd() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/hg-dup-root"
+  make_state_home "$case_dir"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_failing_systemctl "$fakebin"     # systemd down: crash-loop check must skip
+  add_fake_pgrep_duplicates "$fakebin"  # ... yet the pgrep duplicate check must run
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *"ALERT: multiple no-mistakes daemons serve root"*"stale-cache push risk"*) ;;
+    *) fail "duplicate-root ALERT missing without systemd; got: $out" ;;
+  esac
+  pass "duplicate-root pgrep check runs without systemd"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -792,3 +848,5 @@ test_crew_dispatch_validation
 test_health_gate_silent_when_healthy
 test_health_gate_afk_daemon_dark
 test_health_gate_watcher_stale
+test_health_gate_detect_only_reports_without_repair
+test_health_gate_duplicate_daemons_without_systemd

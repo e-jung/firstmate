@@ -321,12 +321,24 @@ secondmate_liveness_sweep() {
   return 0
 }
 
+# One ALERT line. $1 = problem, $2 = concrete repair. In a detect-only
+# (read-only) session drop the repair directive and report the lapse only,
+# mirroring bin/fm-guard.sh's FM_GUARD_READ_ONLY wording so a read-only captain
+# is never steered to mutate fleet state the lock-holding session owns.
+_bootstrap_alert() {
+  if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" = 1 ]; then
+    printf 'ALERT: %s - read-only session: report the lapse, not repair it (the session holding the fleet lock owns the repair)\n' "$1"
+  else
+    printf 'ALERT: %s - %s\n' "$1" "$2"
+  fi
+}
+
 # Fleet daemon + watcher health gate. Runs LAST so it never blocks tool detection
 # or fleet sync, and surfaces one ALERT line per LIVE problem. Like MISSING and
 # STUCK lines it is surfaced to the captain; bootstrap still exits 0 (it warns,
 # never blocks - mirroring bin/fm-guard.sh's contract). Every check degrades
 # silently when its detection mechanism is unavailable (no systemd --user, no
-# pgrep), so a non-Linux or stripped host simply skips the systemd-based checks.
+# pgrep), so a non-Linux or stripped host simply skips the unavailable checks.
 daemon_health_check() {
   [ -d "$STATE" ] || return 0
   local grace=${FM_GUARD_GRACE:-300} pid
@@ -340,49 +352,56 @@ daemon_health_check() {
   if [ -e "$STATE/.afk" ]; then
     pid=$(cat "$STATE/.supervise-daemon.pid" 2>/dev/null || true)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      echo "ALERT: afk is on but the away-mode daemon is not running - escalations are dark; re-enter /afk or run: nohup bin/fm-supervise-daemon.sh >/dev/null 2>&1 &"
+      _bootstrap_alert \
+        "afk is on but the away-mode daemon is not running - escalations are dark" \
+        "re-enter /afk or run: nohup bin/fm-supervise-daemon.sh >/dev/null 2>&1 &"
     fi
   fi
 
   # (2) watcher beacon fresh when work is in flight. Uses the shared grace-based
   #     predicate (bin/fm-supervision-lib.sh, the same one bin/fm-guard.sh reads)
-#     so this cold-start ALERT never drifts from the runtime banner it mirrors:
-#     .last-watcher-beat stale or missing with tasks in flight means
+  #     so this cold-start ALERT never drifts from the runtime banner it mirrors:
+  #     .last-watcher-beat stale or missing with tasks in flight means
   #     supervision is off, surfaced here at cold start so recovery does not
   #     silently proceed unsupervised.
   fm_supervision_status "$STATE" "$grace"
   if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$FM_SUP_WATCHER_FRESH" = false ]; then
-    echo "ALERT: watcher beacon is stale (${FM_SUP_BEACON_DESC}, grace ${grace}s) with ${FM_SUP_IN_FLIGHT} task(s) in flight - supervision is off; re-arm: bin/fm-watch-arm.sh as a harness-tracked background task"
+    _bootstrap_alert \
+      "watcher beacon is stale (${FM_SUP_BEACON_DESC}, grace ${grace}s) with ${FM_SUP_IN_FLIGHT} task(s) in flight - supervision is off" \
+      "re-arm: bin/fm-watch-arm.sh as a harness-tracked background task"
   fi
 
   _bootstrap_nm_health
 }
 
-# no-mistakes daemon health (crash-loops + duplicate-root daemons). systemd
-# --user only; degrades silently otherwise. The two failure modes are the live
-# resilience gaps: a leaked unit flapping against a deleted binary burns CPU +
-# journals, and more than one daemon serving one --root is the stale-cache
-# push-failure mechanism.
+# no-mistakes daemon health (crash-loops + duplicate-root daemons). The crash-
+# loop check is systemd --user only; the duplicate-root check is pgrep-based and
+# runs independently so nohup-started strays are caught on non-systemd hosts.
+# Each degrades silently where its own detection mechanism is unavailable. The
+# two failure modes are the live resilience gaps: a leaked unit flapping against
+# a deleted binary burns CPU + journals, and more than one daemon serving one
+# --root is the stale-cache push-failure mechanism.
 _bootstrap_nm_health() {
-  command -v systemctl >/dev/null 2>&1 || return 0
-  systemctl --user show-environment >/dev/null 2>&1 || return 0
-
   # (3) crash-looping nm units: a high NRestarts means a unit is flapping.
-  #     Threshold defaults to 50; FM_NM_CRASH_THRESHOLD overrides.
-  local threshold=${FM_NM_CRASH_THRESHOLD:-50} unit nrestarts crashing=""
-  while IFS= read -r unit; do
-    [ -n "$unit" ] || continue
-    nrestarts=$(systemctl --user show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
-    case "$nrestarts" in ''|*[!0-9]*) nrestarts=0 ;; esac
-    [ "$nrestarts" -ge "$threshold" ] && crashing="$crashing $unit(${nrestarts})"
-  done < <(systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^no-mistakes-daemon-/ {print $1}')
-  if [ -n "$crashing" ]; then
-    echo "ALERT: no-mistakes daemon unit(s) crash-looping (high NRestarts):$crashing - investigate/reset: systemctl --user stop '<unit>' && systemctl --user reset-failed '<unit>'"
+  #     Threshold defaults to 50; FM_NM_CRASH_THRESHOLD overrides. Needs
+  #     systemd --user, so it degrades silently on a non-systemd host.
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    local threshold=${FM_NM_CRASH_THRESHOLD:-50} unit nrestarts crashing=""
+    while IFS= read -r unit; do
+      [ -n "$unit" ] || continue
+      nrestarts=$(systemctl --user show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+      case "$nrestarts" in ''|*[!0-9]*) nrestarts=0 ;; esac
+      [ "$nrestarts" -ge "$threshold" ] && crashing="$crashing $unit(${nrestarts})"
+    done < <(systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^no-mistakes-daemon-/ {print $1}')
+    [ -n "$crashing" ] && _bootstrap_alert \
+      "no-mistakes daemon unit(s) crash-looping (high NRestarts):$crashing" \
+      "investigate/reset: systemctl --user stop '<unit>' && systemctl --user reset-failed '<unit>'"
   fi
 
   # (4) duplicate nm daemons on one root. More than one process serving the same
   #     --root lets an old daemon with stale in-memory gate config serve pushes
-  #     after the on-disk gate was re-initialized.
+  #     after the on-disk gate was re-initialized. pgrep-based, so unlike the
+  #     crash-loop check it runs without systemd (where nohup strays are common).
   command -v pgrep >/dev/null 2>&1 || return 0
   local dup line
   dup=$(pgrep -af 'no-mistakes daemon run --root' 2>/dev/null \
@@ -390,7 +409,9 @@ _bootstrap_nm_health() {
   [ -z "$dup" ] && return 0
   for line in $dup; do
     [ -n "$line" ] || continue
-    echo "ALERT: multiple no-mistakes daemons serve root '$line' (stale-cache push risk) - reconcile: keep the systemd-managed one, kill the stray nohup processes"
+    _bootstrap_alert \
+      "multiple no-mistakes daemons serve root '$line' (stale-cache push risk)" \
+      "reconcile: keep the systemd-managed one, kill the stray nohup processes"
   done
 }
 
