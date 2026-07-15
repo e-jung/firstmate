@@ -109,6 +109,7 @@ an ERROR in the daemon log, a durable
 catch-up if present), a tmux status-line flash when applicable, and a configurable backend-independent active alert.
 `docs/wedge-alarm.md` owns the alert channel setup and verification record.
 So a guard false-positive becomes a visible stall, never an unbounded silent no-op.
+Two early-wedge triggers raise the SAME alarm BEFORE `FM_MAX_DEFER_SECS`, so a broken wake path surfaces fast instead of waiting out the full timeout: `FM_DEFER_STREAK_MAX` (default 8) fires after that many consecutive non-busy inject deferrals — a rising idle-pane streak is the classifier-failure signature — and the read-only wake-path canary (`FM_CANARY_INTERVAL_SECS`, default 900) probes the full target/busy/composer path on its own cadence. `docs/wedge-alarm.md` owns both.
 
 ## Submit model
 
