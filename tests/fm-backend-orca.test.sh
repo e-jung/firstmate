@@ -133,6 +133,72 @@ test_runtime_check_refuses_unready_orca_status() {
   pass "fm_backend_orca_runtime_check: fails closed when runtime is not ready"
 }
 
+test_runtime_check_refuses_reachable_non_ready_state() {
+  local out status
+  orca_case runtime-reachable-degraded
+  printf '{"ok":true,"result":{"runtime":{"reachable":true,"state":"degraded"}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_runtime_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check should fail when a reachable runtime is not in the ready state"
+  assert_contains "$out" "requires a ready Orca runtime" "runtime_check should explain the readiness requirement for a reachable-but-degraded runtime"
+  assert_contains "$out" "state=degraded" "runtime_check should name the non-ready state"
+  pass "fm_backend_orca_runtime_check: fails closed when a reachable runtime is not ready"
+}
+
+test_runtime_check_refuses_orca_ok_false_status() {
+  local out status
+  orca_case runtime-ok-false
+  printf '{"ok":false,"error":{"message":"runtime overloaded"}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_runtime_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check should fail when Orca status reports ok:false"
+  assert_contains "$out" "Orca runtime is not ready" "runtime_check should name the readiness failure from an ok:false status"
+  assert_contains "$out" "runtime overloaded" "runtime_check should surface the Orca status error message"
+  pass "fm_backend_orca_runtime_check: fails closed and surfaces ok:false status errors"
+}
+
+test_runtime_check_refuses_malformed_status_json() {
+  local out status
+  orca_case runtime-malformed-json
+  printf 'this is not json {{{\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_runtime_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check should fail when orca status emits malformed JSON"
+  assert_contains "$out" "invalid Orca status JSON" "runtime_check should report the JSON parse failure"
+  pass "fm_backend_orca_runtime_check: fails closed on malformed status JSON without crashing"
+}
+
+test_runtime_check_refuses_status_command_failure() {
+  local out status
+  orca_case runtime-cmd-failure
+  printf '1\n' > "$RESP/1.exit"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_runtime_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check should fail when 'orca status --json' exits non-zero"
+  assert_contains "$out" "'orca status --json' failed" "runtime_check should name the failed status command"
+  pass "fm_backend_orca_runtime_check: fails closed when the status command itself fails"
+}
+
+test_runtime_check_refuses_stale_bootstrap() {
+  local out status
+  orca_case runtime-stale-bootstrap
+  printf '{"ok":true,"result":{"runtime":{"reachable":false,"state":"stale_bootstrap"}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_runtime_check' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "runtime_check should fail closed when Orca reports stale_bootstrap"
+  assert_contains "$out" "stale_bootstrap" "runtime_check should name the stale_bootstrap state"
+  assert_contains "$out" "not alive" "runtime_check should explain the local runtime is not alive"
+  assert_contains "$out" "desktop app" "runtime_check should point operators at the Orca desktop app"
+  assert_contains "$out" "orca serve" "runtime_check should point operators at a supervised orca serve service"
+  assert_not_contains "$out" "requires a ready Orca runtime" "stale_bootstrap should use the actionable message, not the generic readiness line"
+  pass "fm_backend_orca_runtime_check: emits an actionable cross-platform message for stale_bootstrap"
+}
+
 test_send_text_submit_verifies_empty_composer_after_enter() {
   local out
   orca_case send-submit
@@ -1277,6 +1343,11 @@ test_capture_falls_back_to_text_fields
 test_capture_fails_on_orca_error_json
 test_runtime_check_accepts_ready_orca_status
 test_runtime_check_refuses_unready_orca_status
+test_runtime_check_refuses_reachable_non_ready_state
+test_runtime_check_refuses_orca_ok_false_status
+test_runtime_check_refuses_malformed_status_json
+test_runtime_check_refuses_status_command_failure
+test_runtime_check_refuses_stale_bootstrap
 test_send_text_submit_verifies_empty_composer_after_enter
 test_send_text_submit_keeps_current_tail_when_limited
 test_send_text_submit_retries_when_composer_stays_pending
