@@ -76,7 +76,7 @@ Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, r
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
-When away-mode injection wedges past `FM_MAX_DEFER_SECS`, the sub-supervisor raises a loud, rate-limited alarm.
+When the away-mode wake path wedges, the sub-supervisor raises a loud, rate-limited alarm.
 Beyond the durable `state/.subsuper-inject-wedged` marker and the tmux status-line flash, it attempts a configured backend-independent active alert that can reach the captain even when every pane and its backend status-line is unreadable.
 `config/wedge-alarm` (local, gitignored) lists channel directives, one per non-empty, non-comment line; every listed non-`off` channel fires, best-effort.
 `FM_WEDGE_ALARM_CHANNEL` overrides the file with a single directive.
@@ -392,6 +392,8 @@ FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; t
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
 FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
 FM_MAX_DEFER_SECS=300              # max buffered escalation age before retry plus wedge alarm; 0 disables
+FM_DEFER_STREAK_MAX=8              # early-wedge: consecutive non-busy inject deferrals on a still-pending escalation before the same wedge alarm fires (a rising idle-pane streak is a classifier failure); a confirmed delivery or busy-pane defer resets it; 0 disables (docs/wedge-alarm.md)
+FM_CANARY_INTERVAL_SECS=900        # early-wedge: cadence of a read-only probe of the full supervisor wake path that alarms when an idle pane cannot confirm an inject would land; 0 disables (docs/wedge-alarm.md)
 FM_WEDGE_ALARM_CHANNEL=            # override config/wedge-alarm with one active-alert directive for the wedge alarm; off|auto|osascript|herdr|command:<cmd>; absent = auto (macOS -> an OS notification)
 FM_WEDGE_ALARM_EXEC=              # notifier seam: route every channel (osascript, herdr, command:) through this command as `<cmd> <channel> <summary>`; "discard" fires nothing; unset in production; the daemon defaults it to "discard" when sourced so no test posts a real notification (docs/wedge-alarm.md)
 FM_WEDGE_ALARM_TIMEOUT_SECS=10    # maximum seconds for each osascript, herdr, override, or command: notifier before its watchdog terminates it and continues to the next channel; invalid or zero values use 10
