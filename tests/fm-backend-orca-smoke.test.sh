@@ -57,17 +57,19 @@ fm_backend_orca_tool_check >/dev/null 2>&1 || { echo "skip: orca CLI not found o
 fm_backend_orca_runtime_check >/dev/null 2>&1 \
   || { echo "skip: Orca runtime not ready (reachable=true, state=ready required)"; exit 0; }
 
-# --- scratch world: a uniquely-prefixed throwaway git repo --------------------
-# Physically resolved (mktemp -d under a pwd -P tmp root) so Orca's path: selector
-# and the adapter's pwd -P canonicalization agree, free of OS symlink noise.
-TMP_ROOT=$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/fm-backend-orca-smoke.XXXXXX") \
-  || { echo "skip: could not create a scratch directory"; exit 0; }
-SCRATCH_REPO="$TMP_ROOT/fm-orca-smoke-repo"
-mkdir -p "$SCRATCH_REPO"
+# --- scratch world: a stable, reused throwaway git repo -----------------------
+# Deterministic path (no random suffix) so fm_backend_orca_repo_ensure reuses the
+# SAME Orca registration across runs instead of adding a path-dangling one each
+# run. Idempotent setup (git init no-ops; the commit no-ops once initial exists),
+# so repeated or concurrent runs are safe. Physically resolved under a pwd -P tmp
+# root so Orca's path: selector and the adapter's pwd -P canonicalization agree.
+TMP_ROOT=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+SCRATCH_REPO="$TMP_ROOT/fm-test-smoke-orca-repo"
+mkdir -p "$SCRATCH_REPO" || { echo "skip: could not create a scratch directory"; exit 0; }
 git -C "$SCRATCH_REPO" init -q
 printf '# scratch\n' > "$SCRATCH_REPO/README.md"
 git -C "$SCRATCH_REPO" add README.md
-git -C "$SCRATCH_REPO" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+git -C "$SCRATCH_REPO" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial 2>/dev/null || true
 SCRATCH_REPO=$(cd "$SCRATCH_REPO" && pwd -P)
 
 LABEL="fm-test-smoke-$$"
@@ -75,9 +77,10 @@ WT_ID=""
 TERMINAL=""
 
 cleanup_all() {
-  # Best-effort, ordered, idempotent: close the terminal first, then remove the
-  # worktree (which also stops its terminals), then drop the scratch repo. Never
-  # touches any Orca state this test did not create.
+  # Best-effort, ordered, idempotent: close the terminal, then remove the
+  # worktree (which also stops its terminals). Never touches any Orca state this
+  # test did not create; the stable scratch repo is intentionally reused across
+  # runs (its path is what keeps the Orca repo registration idempotent), not rm'd.
   if [ -n "${TERMINAL:-}" ]; then
     fm_backend_orca_kill "$TERMINAL" >/dev/null 2>&1 || true
     TERMINAL=""
@@ -86,7 +89,6 @@ cleanup_all() {
     fm_backend_orca_remove_worktree "$WT_ID" >/dev/null 2>&1 || true
     WT_ID=""
   fi
-  [ -z "${TMP_ROOT:-}" ] || rm -rf "$TMP_ROOT"
 }
 trap cleanup_all EXIT
 
