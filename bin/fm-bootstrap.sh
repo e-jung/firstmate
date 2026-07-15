@@ -15,6 +15,14 @@
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "ALERT: ..." = a live fleet-health problem (afk on but the
+#                 away-mode daemon is dark, the watcher beacon is stale with
+#                 tasks in flight, a crash-looping no-mistakes daemon unit, or
+#                 duplicate no-mistakes daemons on one root) with a suggested fix.
+#                 Like MISSING/STUCK it is surfaced to the captain, not a hard
+#                 block; bootstrap still exits 0. The gate runs even in
+#                 detect-only mode since it mutates nothing and the cold-start
+#                 counterpart of fm-guard.sh's alarms belongs in every digest.
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
 #          current default-branch commit (a purely LOCAL fast-forward, never an
@@ -97,6 +105,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-supervision-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -309,6 +319,79 @@ secondmate_liveness_sweep() {
     esac
   done
   return 0
+}
+
+# Fleet daemon + watcher health gate. Runs LAST so it never blocks tool detection
+# or fleet sync, and surfaces one ALERT line per LIVE problem. Like MISSING and
+# STUCK lines it is surfaced to the captain; bootstrap still exits 0 (it warns,
+# never blocks - mirroring bin/fm-guard.sh's contract). Every check degrades
+# silently when its detection mechanism is unavailable (no systemd --user, no
+# pgrep), so a non-Linux or stripped host simply skips the systemd-based checks.
+daemon_health_check() {
+  [ -d "$STATE" ] || return 0
+  local grace=${FM_GUARD_GRACE:-300} pid
+
+  # (1) afk daemon alive when afk is active. If state/.afk is present the
+  #     away-mode engine MUST be running or its escalation path is silently dark
+  #     (a routine wake during a walk-away would never reach the captain). The
+  #     afk skill starts the daemon with `nohup bin/fm-supervise-daemon.sh &` and
+  #     records its pid in state/.supervise-daemon.pid, so liveness is read from
+  #     that pidfile: a missing/empty pidfile or a dead pid is the dark state.
+  if [ -e "$STATE/.afk" ]; then
+    pid=$(cat "$STATE/.supervise-daemon.pid" 2>/dev/null || true)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      echo "ALERT: afk is on but the away-mode daemon is not running - escalations are dark; re-enter /afk or run: nohup bin/fm-supervise-daemon.sh >/dev/null 2>&1 &"
+    fi
+  fi
+
+  # (2) watcher beacon fresh when work is in flight. Uses the shared grace-based
+  #     predicate (bin/fm-supervision-lib.sh, the same one bin/fm-guard.sh reads)
+#     so this cold-start ALERT never drifts from the runtime banner it mirrors:
+#     .last-watcher-beat stale or missing with tasks in flight means
+  #     supervision is off, surfaced here at cold start so recovery does not
+  #     silently proceed unsupervised.
+  fm_supervision_status "$STATE" "$grace"
+  if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$FM_SUP_WATCHER_FRESH" = false ]; then
+    echo "ALERT: watcher beacon is stale (${FM_SUP_BEACON_DESC}, grace ${grace}s) with ${FM_SUP_IN_FLIGHT} task(s) in flight - supervision is off; re-arm: bin/fm-watch-arm.sh as a harness-tracked background task"
+  fi
+
+  _bootstrap_nm_health
+}
+
+# no-mistakes daemon health (crash-loops + duplicate-root daemons). systemd
+# --user only; degrades silently otherwise. The two failure modes are the live
+# resilience gaps: a leaked unit flapping against a deleted binary burns CPU +
+# journals, and more than one daemon serving one --root is the stale-cache
+# push-failure mechanism.
+_bootstrap_nm_health() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl --user show-environment >/dev/null 2>&1 || return 0
+
+  # (3) crash-looping nm units: a high NRestarts means a unit is flapping.
+  #     Threshold defaults to 50; FM_NM_CRASH_THRESHOLD overrides.
+  local threshold=${FM_NM_CRASH_THRESHOLD:-50} unit nrestarts crashing=""
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    nrestarts=$(systemctl --user show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+    case "$nrestarts" in ''|*[!0-9]*) nrestarts=0 ;; esac
+    [ "$nrestarts" -ge "$threshold" ] && crashing="$crashing $unit(${nrestarts})"
+  done < <(systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^no-mistakes-daemon-/ {print $1}')
+  if [ -n "$crashing" ]; then
+    echo "ALERT: no-mistakes daemon unit(s) crash-looping (high NRestarts):$crashing - investigate/reset: systemctl --user stop '<unit>' && systemctl --user reset-failed '<unit>'"
+  fi
+
+  # (4) duplicate nm daemons on one root. More than one process serving the same
+  #     --root lets an old daemon with stale in-memory gate config serve pushes
+  #     after the on-disk gate was re-initialized.
+  command -v pgrep >/dev/null 2>&1 || return 0
+  local dup line
+  dup=$(pgrep -af 'no-mistakes daemon run --root' 2>/dev/null \
+        | sed -nE 's/.*--root ([^ ]+).*/\1/p' | sort | uniq -d)
+  [ -z "$dup" ] && return 0
+  for line in $dup; do
+    [ -n "$line" ] || continue
+    echo "ALERT: multiple no-mistakes daemons serve root '$line' (stale-cache push risk) - reconcile: keep the systemd-managed one, kill the stray nohup processes"
+  done
 }
 
 install_cmd() {
@@ -637,4 +720,5 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   x_mode_setup
   fleet_sync
 fi
+daemon_health_check
 exit 0

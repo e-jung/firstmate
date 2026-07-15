@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, ALERT, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -47,3 +47,7 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
   A secondmate that was skipped, already current, or whose advance changed no instructions is not listed and must not be disturbed.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `ALERT: <problem> - <suggested fix>` - a live fleet-health problem surfaced at cold start (the counterpart of `fm-guard.sh`'s runtime alarms, so the same condition does not need a separate reaction here): afk is on but the away-mode daemon is not running (its pid in `state/.supervise-daemon.pid` is missing or dead, so walk-away escalations are dark), the watcher beacon (`.last-watcher-beat`) is stale or missing past `FM_GUARD_GRACE` while tasks are in flight, a `no-mistakes-daemon-*` systemd unit is crash-looping (NRestarts at or above `FM_NM_CRASH_THRESHOLD`, default 50), or multiple no-mistakes daemons serve one `--root` (stale-cache push risk).
+  Like `MISSING`/`STUCK` it is surfaced to the captain and never a hard block - bootstrap still exits 0.
+  The gate runs even in detect-only and read-only sessions because it mutates nothing, and each systemd- or pgrep-based check degrades silently where its detection mechanism is unavailable (non-Linux or stripped host).
+  Apply the suggested fix on the line (re-enter `/afk`, re-arm the watcher, or stop/reset the offending daemon unit); none of these block dispatching work.

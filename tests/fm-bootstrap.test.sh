@@ -696,6 +696,81 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+# --- daemon/watcher health gate (ALERT lines) ---------------------------------
+#
+# The health gate is the cold-start counterpart of bin/fm-guard.sh: it surfaces
+# one ALERT line per live fleet-health problem and stays silent when healthy.
+# A FAILING fake systemctl makes the systemd-based no-mistakes checks degrade
+# silently; the afk-dark ALERT is driven by the pidfile (a dead pid), so each
+# case below exercises both a real ALERT and the silent-degradation path at once.
+add_failing_systemctl() {
+  local fakebin=$1
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/systemctl"
+  chmod +x "$fakebin/systemctl"
+}
+
+# make_state_home <dir>: lay down an empty FM_HOME shell with state/ + projects/.
+make_state_home() {
+  local dir=$1
+  mkdir -p "$dir/home/state" "$dir/home/projects"
+}
+
+test_health_gate_silent_when_healthy() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/hg-healthy"
+  make_state_home "$case_dir"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_failing_systemctl "$fakebin"
+  # No .afk and no in-flight task: the health gate must print no ALERT.
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *ALERT*) fail "health gate emitted an ALERT on a healthy fleet: $out" ;;
+  esac
+  pass "health gate is silent on a healthy fleet"
+}
+
+test_health_gate_afk_daemon_dark() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/hg-afk-dark"
+  make_state_home "$case_dir"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_failing_systemctl "$fakebin"
+  : > "$case_dir/home/state/.afk"           # afk on ...
+  # pidfile points at a PID that is not alive (and not us): daemon dark.
+  echo 999999 > "$case_dir/home/state/.supervise-daemon.pid"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *"ALERT: afk is on but the away-mode daemon is not running"*) ;;
+    *) fail "afk-dark ALERT missing; got: $out" ;;
+  esac
+  # The systemd-based nm checks must NOT emit a spurious ALERT when systemd is
+  # unavailable (silent degradation).
+  case "$out" in
+    *"no-mistakes daemon unit"*) fail "nm crash-loop ALERT leaked without systemd: $out" ;;
+  esac
+  pass "health gate alerts when afk is on but the daemon is dark"
+}
+
+test_health_gate_watcher_stale() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/hg-watcher-stale"
+  make_state_home "$case_dir"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_failing_systemctl "$fakebin"
+  echo "window=firstmate:fm-demo" > "$case_dir/home/state/demo.meta"  # one task in flight
+  touch "$case_dir/home/state/.last-watcher-beat"
+  touch -d @1 "$case_dir/home/state/.last-watcher-beat"   # epoch -> far past grace
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *"ALERT: watcher beacon is"*"stale"*"supervision is off"*) ;;
+    *) fail "watcher-stale ALERT missing; got: $out" ;;
+  esac
+  pass "health gate alerts when the watcher beacon is stale with work in flight"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -714,3 +789,6 @@ test_fleet_sync_timeout_empty_override_uses_default
 test_fleet_sync_timeout_is_computed_before_launch
 test_crew_dispatch_active_rules_are_surfaced
 test_crew_dispatch_validation
+test_health_gate_silent_when_healthy
+test_health_gate_afk_daemon_dark
+test_health_gate_watcher_stale
