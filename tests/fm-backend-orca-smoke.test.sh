@@ -60,9 +60,10 @@ fm_backend_orca_runtime_check >/dev/null 2>&1 \
 # --- scratch world: a stable, reused throwaway git repo -----------------------
 # Deterministic path (no random suffix) so fm_backend_orca_repo_ensure reuses the
 # SAME Orca registration across runs instead of adding a path-dangling one each
-# run. Idempotent setup (git init no-ops; the commit no-ops once initial exists),
-# so repeated or concurrent runs are safe. Physically resolved under a pwd -P tmp
-# root so Orca's path: selector and the adapter's pwd -P canonicalization agree.
+# run. Idempotent setup (git init no-ops on an existing repo; the commit is a
+# no-op once initial exists), so repeated runs reuse it cleanly. Physically
+# resolved under a pwd -P tmp root so Orca's path: selector and the adapter's
+# pwd -P canonicalization agree.
 TMP_ROOT=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 SCRATCH_REPO="$TMP_ROOT/fm-test-smoke-orca-repo"
 mkdir -p "$SCRATCH_REPO" || { echo "skip: could not create a scratch directory"; exit 0; }
@@ -71,6 +72,7 @@ printf '# scratch\n' > "$SCRATCH_REPO/README.md"
 git -C "$SCRATCH_REPO" add README.md
 git -C "$SCRATCH_REPO" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial 2>/dev/null || true
 SCRATCH_REPO=$(cd "$SCRATCH_REPO" && pwd -P)
+LOCK_DIR="$SCRATCH_REPO.lock"
 
 LABEL="fm-test-smoke-$$"
 WT_ID=""
@@ -92,12 +94,39 @@ cleanup_all() {
 }
 trap cleanup_all EXIT
 
+# orca_smoke_repo_ensure_locked: mkdir-serialize repo_ensure (atomic, no flock,
+# Linux+macOS) so concurrent runs reuse one registration instead of racing on
+# show-then-add. Reclaimed when the holder is gone (or past a ~30s backstop) and
+# always released on exit. <project-path> <lock-dir> -> repo id.
+orca_smoke_repo_ensure_locked() {  # <project-path> <lock-dir>
+  local project=$1 lock_dir=$2 spins=0 holder id rc
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf "$lock_dir"
+      continue
+    fi
+    sleep 0.2
+    spins=$((spins + 1))
+    if [ "$spins" -ge 150 ]; then
+      rm -rf "$lock_dir"
+      spins=0
+    fi
+  done
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  id=$(fm_backend_orca_repo_ensure "$project")
+  rc=$?
+  rm -rf "$lock_dir"
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$id"
+}
+
 # 1. Readiness: the skip gate above already ran runtime_check against the real
 #    `orca status --json`; re-affirm it as a numbered assertion.
 pass "real orca: runtime_check accepts a ready Orca runtime (reachable=true, state=ready)"
 
 # 2. Repo registration: path: lookup with an add fallback.
-REPO_ID=$(fm_backend_orca_repo_ensure "$SCRATCH_REPO") \
+REPO_ID=$(orca_smoke_repo_ensure_locked "$SCRATCH_REPO" "$LOCK_DIR") \
   || fail "repo_ensure failed to register the scratch repo"
 [ -n "$REPO_ID" ] || fail "repo_ensure returned an empty repo id"
 pass "real orca: repo_ensure registers the scratch repo and returns a repo id"
