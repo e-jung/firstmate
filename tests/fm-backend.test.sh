@@ -531,8 +531,8 @@ test_resolve_selector_three_forms() {
     || fail "exact fm-* task id should resolve through its exact metadata"
   [ "$(fm_backend_of_selector 'fm-turnend-all-harnesses-v9' 'default:wB:p3' "$state")" = herdr ] \
     || fail "exact fm-* task id should use exact metadata without stripping fm-"
-  [ "$(fm_backend_expected_label_of_selector 'fm-turnend-all-harnesses-v9' "$state")" = "fm-fm-turnend-all-harnesses-v9" ] \
-    || fail "exact fm-* task id should report the spawned fm-<id> label"
+  [ "$(fm_backend_expected_label_of_selector 'fm-turnend-all-harnesses-v9' "$state")" = "fm-turnend-all-harnesses-v9" ] \
+    || fail "exact fm-* task id should report an idempotent fm-<id> label (no doubling)"
 
   [ "$(fm_backend_resolve_selector 'fm-task1' "$state")" = "firstmate:fm-task1" ] \
     || fail "legacy fm-<id> label should resolve through <id>.meta's window="
@@ -596,6 +596,35 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "explicit target with no matching metadata should keep the tmux compatibility default"
 
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
+}
+
+test_alias_for_id_is_idempotent() {
+  [ "$(fm_alias_for_id 'fix-login-k3')" = "fm-fix-login-k3" ] \
+    || fail "fm_alias_for_id should prepend fm- to a bare task id"
+  [ "$(fm_alias_for_id 'fm-orca-task-h2')" = "fm-orca-task-h2" ] \
+    || fail "fm_alias_for_id should NOT double the prefix on an id already starting fm-"
+  [ "$(fm_alias_for_id 'fm-x')" = "fm-x" ] \
+    || fail "fm_alias_for_id should leave a single-char fm- id unchanged"
+  pass "fm_alias_for_id: idempotent fm- prefix (no fm-fm-* doubling)"
+}
+
+test_legacy_doubled_selector_still_resolves() {
+  local state=$TMP_ROOT/doubled-selector-state
+  mkdir -p "$state"
+  fm_write_meta "$state/fm-orca-fix-k2.meta" "window=fm-orca-fix-k2" "backend=orca"
+  # The bare task id (also starts with fm-) resolves through exact metadata.
+  [ "$(fm_backend_task_id_for_selector 'fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "bare fm-* task id should resolve via exact metadata"
+  # Legacy doubled selector fm-fm-<id> still resolves via the single fm- strip.
+  [ "$(fm_backend_task_id_for_selector 'fm-fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "legacy doubled fm-fm-<id> selector must still resolve via single-prefix strip"
+  # The expected label for the bare id is now single-prefix (idempotent).
+  [ "$(fm_backend_expected_label_of_selector 'fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "expected label for an fm-* task id should be idempotent"
+  # A legacy doubled selector still resolves its label to the single-prefix form.
+  [ "$(fm_backend_expected_label_of_selector 'fm-fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "legacy doubled selector label should resolve to the single-prefix idempotent alias"
+  pass "legacy doubled fm-fm-* selectors still resolve through single-prefix strip; expected_label is idempotent"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------
@@ -1079,6 +1108,8 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_alias_for_id_is_idempotent
+test_legacy_doubled_selector_still_resolves
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

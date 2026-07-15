@@ -60,6 +60,7 @@ worktree=<absolute path to the Orca-created git worktree>
 ```
 
 `window=` remains the shared firstmate alias used by selector-driven supervision tools after a task selector has resolved through metadata.
+The alias is idempotent: a task id already beginning with `fm-` (e.g. `fm-orca-fix-k2`) keeps that exact name rather than becoming `fm-fm-orca-fix-k2`.
 `fm-teardown.sh <id>` uses the same recorded fields after loading `state/<id>.meta`.
 For Orca, `window=` keeps the stable firstmate alias while `terminal=` carries the stable Orca terminal handle that backend operations use.
 The recorded `backend=orca` field tells shared call sites to route capture, send, interrupt, and close through `bin/backends/orca.sh` instead of tmux assumptions.
@@ -69,7 +70,7 @@ The recorded `backend=orca` field tells shared call sites to route capture, send
 Spawn:
 
 1. Ensure the project repo is registered in Orca, adding it with `orca repo add --path` when needed.
-2. Create an independent Orca worktree with `orca worktree create --repo id:<repo> --name fm-<id> --no-parent --setup skip`.
+2. Create an Orca worktree with `orca worktree create --repo id:<repo> --name fm-<id> --parent-worktree id:$ORCA_WORKTREE_ID --setup skip` when firstmate itself runs under Orca (so the delegate nests beneath the captain's session in the sidebar), or `--no-parent` when no trustworthy parent is discoverable.
 3. Reuse the terminal returned by Orca worktree creation only when it appears in the verified `result.terminal.handle` shape, or create a titled terminal in that worktree when Orca returns only the worktree.
 4. Install firstmate's per-harness turn-end hooks in the Orca worktree.
 5. Write metadata, then send `GOTMPDIR` export and the selected harness launch through the recorded Orca terminal.
@@ -108,6 +109,7 @@ Firstmate intentionally ignores speculative terminal-handle shapes such as bare 
 Fake-Orca tests cover:
 
 - helper parsing for repo registration, worktree creation, verified implicit-terminal reuse, terminal creation, terminal sends, and worktree removal;
+- parent linkage: `--parent-worktree` is used when firstmate runs under Orca (`ORCA_WORKTREE_ID` set and repo-qualified), with best-effort fallback to `--no-parent` when the parent is absent, stale, or not discoverable;
 - rejection of undocumented terminal-handle result shapes;
 - runtime readiness gating through `orca status --json`;
 - `fm-spawn.sh --backend orca` metadata creation and harness launch;

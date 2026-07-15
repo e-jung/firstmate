@@ -692,7 +692,7 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
-W="fm-$ID"
+W=$(fm_alias_for_id "$ID")
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)

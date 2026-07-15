@@ -396,7 +396,7 @@ test_worktree_and_terminal_helpers_parse_json() {
   printf '{"ok":true,"result":{"worktree":{"id":"wt-123","path":"/tmp/orca-wt"}}}\n' > "$RESP/3.out"
   printf '{"ok":true,"result":{"terminal":{"handle":"term-123"}}}\n' > "$RESP/4.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
-    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
+    bash -c 'unset ORCA_WORKTREE_ID; . "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
   wt_id=${out%%$'\t'*}
   wt_path=${out#*$'\t'}
   [ "$wt_id" = wt-123 ] || fail "worktree helper should print worktree id, got '$wt_id'"
@@ -413,6 +413,103 @@ test_worktree_and_terminal_helpers_parse_json() {
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create'$'\x1f''--worktree'$'\x1f''id:wt-123'$'\x1f''--title'$'\x1f''fm-task'$'\x1f''--json' \
     "terminal helper did not create a titled terminal for the worktree"
   pass "Orca lifecycle helpers: register repo, create worktree, create terminal, parse stable ids"
+}
+
+test_parent_selector_returns_id_prefixed_worktree() {
+  local out
+  orca_case parent-selector
+  out=$( bash -c '. "$0/bin/backends/orca.sh"; ORCA_WORKTREE_ID="abc-123::/home/captain/firstmate" fm_backend_orca_parent_selector' "$ROOT" )
+  [ "$out" = "id:abc-123::/home/captain/firstmate" ] \
+    || fail "parent_selector should prepend id: to a repo-qualified ORCA_WORKTREE_ID, got '$out'"
+  pass "fm_backend_orca_parent_selector: returns id:-prefixed selector for a repo-qualified worktree id"
+}
+
+test_parent_selector_refuses_empty_or_unqualified_id() {
+  local out status
+  orca_case parent-selector-reject
+  out=$( bash -c 'unset ORCA_WORKTREE_ID; . "$0/bin/backends/orca.sh"; fm_backend_orca_parent_selector' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "parent_selector should fail when ORCA_WORKTREE_ID is unset"
+  out=$( bash -c 'ORCA_WORKTREE_ID=""; . "$0/bin/backends/orca.sh"; fm_backend_orca_parent_selector' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "parent_selector should fail when ORCA_WORKTREE_ID is empty"
+  out=$( bash -c 'ORCA_WORKTREE_ID="bare-id-no-separator"; . "$0/bin/backends/orca.sh"; fm_backend_orca_parent_selector' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "parent_selector should fail when ORCA_WORKTREE_ID lacks the repo-qualified :: separator"
+  pass "fm_backend_orca_parent_selector: refuses empty or non-repo-qualified ids, falls back to --no-parent"
+}
+
+test_worktree_create_uses_parent_when_orca_worktree_id_set() {
+  local out log_text
+  orca_case parent-present
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-parent-present"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-child","path":"/tmp/orca-child"}}}\n' > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    ORCA_WORKTREE_ID="captain-uuid-1::/home/captain/firstmate" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
+  log_text=$(cat "$LOG")
+  assert_contains "$log_text" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-parent-present'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--parent-worktree'$'\x1f''id:captain-uuid-1::/home/captain/firstmate'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
+    "worktree create should pass --parent-worktree with id:-prefixed ORCA_WORKTREE_ID when firstmate runs under Orca"
+  assert_not_contains "$log_text" '--no-parent' \
+    "worktree create should NOT use --no-parent when a trustworthy parent is present"
+  pass "fm_backend_orca_worktree_create: links delegate to captain's session as parent when ORCA_WORKTREE_ID is set"
+}
+
+test_worktree_create_uses_no_parent_when_orca_worktree_id_absent() {
+  local out log_text
+  orca_case parent-absent
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-parent-absent"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-no-parent","path":"/tmp/orca-no-parent"}}}\n' > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c 'unset ORCA_WORKTREE_ID; . "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
+  log_text=$(cat "$LOG")
+  assert_contains "$log_text" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-parent-absent'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--no-parent'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
+    "worktree create should use --no-parent when ORCA_WORKTREE_ID is not set"
+  assert_not_contains "$log_text" '--parent-worktree' \
+    "worktree create should NOT pass --parent-worktree when no parent is discoverable"
+  pass "fm_backend_orca_worktree_create: falls back to --no-parent when firstmate is not under Orca"
+}
+
+test_worktree_create_falls_back_to_no_parent_when_parent_link_fails() {
+  local out log_text create_count
+  orca_case parent-fallback
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-fallback"}}}\n' > "$RESP/2.out"
+  # Response 3: --parent-worktree attempt fails (parent stale/deleted).
+  printf '1\n' > "$RESP/3.exit"
+  # Response 4: --no-parent retry succeeds.
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-fallback","path":"/tmp/orca-fallback"}}}\n' > "$RESP/4.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    ORCA_WORKTREE_ID="stale-uuid::/home/captain/firstmate" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
+  log_text=$(cat "$LOG")
+  assert_contains "$log_text" '--parent-worktree' \
+    "worktree create should first try --parent-worktree when ORCA_WORKTREE_ID is set"
+  assert_contains "$log_text" '--no-parent' \
+    "worktree create should fall back to --no-parent when parent linkage fails"
+  create_count=$(printf '%s\n' "$log_text" | grep -c $'orca\x1fworktree\x1fcreate')
+  [ "$create_count" -eq 2 ] || fail "parent fallback should produce exactly 2 worktree create calls, got $create_count"
+  pass "fm_backend_orca_worktree_create: best-effort parent fallback retries --no-parent when parent linkage fails"
+}
+
+test_worktree_create_shell_safely_passes_repo_qualified_parent_id() {
+  local out log_text
+  orca_case parent-shell-safe
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-shell"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-shell","path":"/tmp/orca-shell"}}}\n' > "$RESP/3.out"
+  # A repo-qualified worktree id with a path containing characters that would
+  # break unquoted shell expansion. The value must arrive as a single arg to
+  # --parent-worktree, verified by the unit-separator-delimited fakebin log.
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    ORCA_WORKTREE_ID="a1b2-c3d4::/home/captain/my firstmate home" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" )
+  log_text=$(cat "$LOG")
+  assert_contains "$log_text" $'\x1f''--parent-worktree'$'\x1f''id:a1b2-c3d4::/home/captain/my firstmate home'$'\x1f' \
+    "worktree create should pass the full repo-qualified parent id as a single shell-safe argument to --parent-worktree"
+  pass "fm_backend_orca_worktree_create: shell-safe handling of repo-qualified worktree IDs with spaces"
 }
 
 test_worktree_create_removes_worktree_when_path_missing() {
@@ -1297,6 +1394,12 @@ test_dispatcher_sources_orca_and_routes_primitives
 test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
 test_worktree_create_removes_worktree_when_path_missing
+test_parent_selector_returns_id_prefixed_worktree
+test_parent_selector_refuses_empty_or_unqualified_id
+test_worktree_create_uses_parent_when_orca_worktree_id_set
+test_worktree_create_uses_no_parent_when_orca_worktree_id_absent
+test_worktree_create_falls_back_to_no_parent_when_parent_link_fails
+test_worktree_create_shell_safely_passes_repo_qualified_parent_id
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_refuses_orca_secondmate_before_home_mutation

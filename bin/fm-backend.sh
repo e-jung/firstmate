@@ -410,10 +410,24 @@ fm_backend_of_selector() {  # <raw-target> <resolved-target> <state-dir>
   printf 'tmux'
 }
 
+# fm_alias_for_id: the stable fm-<id> window/tab label for a task. Idempotent:
+# an id already beginning with fm- is returned unchanged so fm-on-firstmate
+# task ids (e.g. fm-orca-fix-k2) do not become fm-fm-orca-fix-k2 in worktree
+# names, terminal titles, or window= metadata. The single source of truth for
+# the fm- prefix; every call site that derives a window label from a task id
+# must go through here so spawn, expected-label resolution, crew-state, and
+# teardown all agree.
+fm_alias_for_id() {  # <task-id>
+  case "$1" in
+    fm-*) printf '%s' "$1" ;;
+    *) printf 'fm-%s' "$1" ;;
+  esac
+}
+
 fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
   local raw=$1 state=$2 id
   id=$(fm_backend_task_id_for_selector "$raw" "$state" 2>/dev/null || true)
-  [ -n "$id" ] && printf 'fm-%s' "$id"
+  [ -n "$id" ] && fm_alias_for_id "$id"
   return 0
 }
 
