@@ -109,7 +109,7 @@ Fake-Orca tests cover:
 
 - helper parsing for repo registration, worktree creation, verified implicit-terminal reuse, terminal creation, terminal sends, and worktree removal;
 - rejection of undocumented terminal-handle result shapes;
-- runtime readiness gating through `orca status --json`;
+- runtime readiness gating through `orca status --json`, including fail-closed handling of a reachable-but-non-ready state, an `ok:false` status, malformed status JSON, a failed status command, and an actionable cross-platform recovery message for the `stale_bootstrap` state (start the Orca desktop app or a supervised `orca serve` service);
 - `fm-spawn.sh --backend orca` metadata creation and harness launch;
 - `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` routing through recorded Orca metadata;
 - slash-command popup placeholder handling that requires a second Enter before `fm-send.sh` reports submission;
