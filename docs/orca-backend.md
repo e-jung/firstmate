@@ -101,7 +101,8 @@ Teardown:
 
 ## Verification
 
-Real-Orca smoke verification was run against `/usr/local/bin/orca` with `/Applications/Orca.app` reporting bundle version `1.4.116`; `orca status --json` reported `result.runtime.reachable=true` and `result.runtime.state="ready"`.
+The committed `tests/fm-backend-orca-smoke.test.sh` records the real-Orca run end to end, driving the adapter against a live Orca runtime (it creates only `fm-test-smoke-`-prefixed disposable artifacts, cleans them up via a trapped EXIT handler, and skips cleanly when `orca` or `node` is absent or the runtime is not ready).
+The originating manual run was against `/usr/local/bin/orca` with `/Applications/Orca.app` reporting bundle version `1.4.116`; `orca status --json` reported `result.runtime.reachable=true` and `result.runtime.state="ready"`.
 The verified terminal creation handle field is `result.terminal.handle` from `orca terminal create --json`; worktree creation returned `result.worktree.id` and `result.worktree.path` in the same smoke run.
 Firstmate intentionally ignores speculative terminal-handle shapes such as bare `result.id` and nested `result.worktree.terminal` until a real Orca smoke run proves them.
 
@@ -123,3 +124,5 @@ tests/fm-backend-orca.test.sh
 tests/fm-backend.test.sh
 tests/fm-bootstrap.test.sh
 ```
+
+`tests/fm-backend-orca-smoke.test.sh` is the real-runtime counterpart - the only one of these that touches real Orca state - and skips cleanly (exit 0) when `orca`/`node` are absent or the runtime is not ready, so CI without Orca is unaffected.
