@@ -520,7 +520,7 @@ For `backend=tmux` every dispatch resolves to the exact same underlying call as 
 For `backend=herdr`, busy detection tries the native `agent.get`-backed `fm_backend_herdr_busy_state` first, trusts only `busy` outright, and corroborates every non-`busy` verdict with the shared regex-over-capture reader before treating the supervisor pane as not busy.
 This mirrors the per-task stale-pane busy check `bin/fm-supervise-daemon.sh`'s `stale_window_is_busy` already used; composer/pending detection and the verified submit route through `fm_backend_herdr_composer_state`/`fm_backend_herdr_send_text_submit`.
 The wedge alarm's supervisor-client status-line flash (`tmux display-message ...`) is tmux-only cosmetic UI with no herdr equivalent, so it is skipped for non-tmux backends.
-A max-defer wedge also attempts the configured backend-independent active alert described in [`wedge-alarm.md`](wedge-alarm.md), while the ERROR log line and durable `state/.subsuper-inject-wedged` marker remain backend-independent.
+Any wedge trigger (max-defer, defer-streak, or canary) also attempts the configured backend-independent active alert described in [`wedge-alarm.md`](wedge-alarm.md), while the ERROR log line and durable `state/.subsuper-inject-wedged` marker remain backend-independent.
 
 **A pre-existing bug this surfaced: `fm_backend_target_exists`'s herdr arm.** Before this task, that function's herdr case called `HERDR_SESSION="$session" herdr pane get "$pane"` directly, WITHOUT the `--session` flag.
 Per "Session targeting" above, `HERDR_SESSION` alone is not reliably honored once another herdr server is already bound on the machine - it silently falls back to whatever server IS running.
