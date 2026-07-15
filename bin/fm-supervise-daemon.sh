@@ -890,30 +890,32 @@ wedge_alarm_notify() {  # <summary> <marker>
 # get the original message byte-for-byte.
 inject_wedge_alarm() {  # <state> <age-seconds> [reason-tag]
   local state=$1 age=$2 tag=${3:-} marker target backend max_defer now notify=1
-  local summary tmux_msg marker_head marker_body
+  local summary tmux_msg marker_head marker_body log_msg
   marker="$state/.subsuper-inject-wedged"
   max_defer="${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}"
   # Re-alarm at most once per max-defer window so a long wedge does not spam.
   if [ "$(_file_age "$marker")" -lt "$max_defer" ]; then
     return 0
   fi
+  if [ -n "$tag" ]; then
+    marker_head=$(printf 'fm away-mode wake path WEDGED (%s) after %ss as of %s\n' "$tag" "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+    marker_body='The supervisor wake path could not confirm a submit would land.'
+    tmux_msg="fm: away-mode wake path WEDGED (${tag}) ${age}s — see $marker"
+    summary="away-mode wake path WEDGED (${tag}) ${age}s - see $marker"
+    log_msg="ERROR: away-mode wake path WEDGED (${tag}) after ${age}s; inject could not confirm a submit. Buffer + wake-queue preserved; alarm marker written."
+  else
+    marker_head=$(printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+    marker_body='The supervisor pane could not accept an escalation. Buffered items:'
+    tmux_msg="fm: away-mode escalations WEDGED ${age}s — see $marker"
+    summary="away-mode escalations WEDGED ${age}s undelivered - see $marker"
+    log_msg="ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
+  fi
   now=$(_now)
   if [ "$WEDGE_ALARM_LAST_EPOCH" -gt 0 ] && [ $((now - WEDGE_ALARM_LAST_EPOCH)) -lt "$max_defer" ]; then
     notify=0
   else
     WEDGE_ALARM_LAST_EPOCH=$now
-    if [ -n "$tag" ]; then
-      log "ERROR: away-mode wake path WEDGED (${tag}) after ${age}s; inject could not confirm a submit. Buffer + wake-queue preserved; alarm marker written."
-    else
-      log "ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
-    fi
-  fi
-  if [ -n "$tag" ]; then
-    marker_head=$(printf 'fm away-mode wake path WEDGED (%s) after %ss as of %s\n' "$tag" "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
-    marker_body='The supervisor wake path could not confirm a submit would land.'
-  else
-    marker_head=$(printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
-    marker_body='The supervisor pane could not accept an escalation. Buffered items:'
+    log "$log_msg"
   fi
   {
     printf '%s\n%s\n' "$marker_head" "$marker_body"
@@ -926,11 +928,6 @@ inject_wedge_alarm() {  # <state> <age-seconds> [reason-tag]
   # the primary, backend-independent signal, so a non-tmux backend just skips
   # this cosmetic extra rather than attempting an unsupported call.
   if [ "$backend" = tmux ]; then
-    if [ -n "$tag" ]; then
-      tmux_msg="fm: away-mode wake path WEDGED (${tag}) ${age}s — see $marker"
-    else
-      tmux_msg="fm: away-mode escalations WEDGED ${age}s — see $marker"
-    fi
     tmux display-message -t "$target" "$tmux_msg" 2>/dev/null || true
   fi
   # Backend-independent active alert. Unlike the tmux flash above (skipped on
@@ -939,11 +936,6 @@ inject_wedge_alarm() {  # <state> <age-seconds> [reason-tag]
   # incident fell through. Configurable and best-effort; the marker above stays
   # the durable record whether or not any channel fires.
   if [ "$notify" -eq 1 ]; then
-    if [ -n "$tag" ]; then
-      summary="away-mode wake path WEDGED (${tag}) ${age}s - see $marker"
-    else
-      summary="away-mode escalations WEDGED ${age}s undelivered - see $marker"
-    fi
     wedge_alarm_notify "$summary" "$marker"
   fi
 }
