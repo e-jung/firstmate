@@ -349,7 +349,7 @@ SH
 
 test_orca_backend_gates_orca_tool_only_when_selected() {
   local case_dir fakebin out missing_orca
-  missing_orca="MISSING: orca (install: brew install orca  # or the platform's package manager)"
+  missing_orca="MISSING_MANUAL: orca (instructions: docs/orca-backend.md)"
 
   case_dir="$TMP_ROOT/orca-backend-selected"
   mkdir -p "$case_dir/home/config"
@@ -368,6 +368,16 @@ test_orca_backend_gates_orca_tool_only_when_selected() {
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_not_contains "$out" "MISSING: orca" "bootstrap should not require orca unless backend=orca is selected"
   pass "bootstrap: backend=orca gates the Orca CLI without requiring it on the default backend"
+}
+
+test_orca_install_requires_manual_action() {
+  local out status
+  out=$("$ROOT/bin/fm-bootstrap.sh" install orca 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "install orca should fail instead of evaluating a fabricated package-manager command"
+  [ "$out" = "error: orca requires manual installation (instructions: docs/orca-backend.md)" ] \
+    || fail "install orca should return actionable manual-install guidance, got: $out"
+  pass "bootstrap: Orca manual-install guidance is never executed as a shell command (no 'brew install orca')"
 }
 
 # Build a fake toolchain with tmux REMOVED and the named backend session CLI(s)
@@ -700,6 +710,7 @@ test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
 test_orca_backend_gates_orca_tool_only_when_selected
+test_orca_install_requires_manual_action
 test_session_provider_backends_do_not_require_tmux
 test_session_provider_backends_gate_own_cli_not_tmux
 test_herdr_install_requires_manual_action
