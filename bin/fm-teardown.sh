@@ -274,6 +274,22 @@ pr_is_merged() {
   unpushed_patches_are_in_pr_head "$head"
 }
 
+# git 2.38 introduced `merge-tree --write-tree`. Older git (e.g. 2.34) lacks it and
+# treats --write-tree as an unknown rev, so content_in_default falls back to an
+# equivalent merge-base content comparison there.
+git_supports_write_tree() {
+  local v major minor
+  v=$(git --version 2>/dev/null | awk '{print $3}') || return 1
+  [ -n "$v" ] || return 1
+  major=${v%%.*}
+  v=${v#*.}
+  minor=${v%%.*}
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 2 ] && return 0
+  [ "$major" -eq 2 ] && [ "$minor" -ge 38 ]
+}
+
 # Is the branch's content already present in the up-to-date default branch? Fetches
 # first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
 # the default branch does not already contain (e.g. its change landed via squash) the
@@ -294,9 +310,25 @@ content_in_default() {
   fi
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
-  [ "$merged_tree" = "$default_tree" ]
+  if git_supports_write_tree; then
+    merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+    merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+    [ "$merged_tree" = "$default_tree" ]
+    return $?
+  fi
+  # Pre-2.38 fallback: merging HEAD into $ref yields $ref's tree iff every change
+  # HEAD makes relative to the merge-base is already present, identically, in $ref.
+  # Comparing each changed path's blob is equivalent to the merge-tree result, and
+  # paths $ref changed past the merge-base without HEAD's involvement stay ignored.
+  local mb path hblob dblob
+  mb=$(git -C "$WT" merge-base "$ref" HEAD 2>/dev/null) || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    hblob=$(git -C "$WT" rev-parse --quiet --verify "HEAD:$path" 2>/dev/null || printf X)
+    dblob=$(git -C "$WT" rev-parse --quiet --verify "$ref:$path" 2>/dev/null || printf X)
+    [ "$hblob" = "$dblob" ] || return 1
+  done < <(git -C "$WT" diff --name-only --no-renames "$mb" HEAD 2>/dev/null)
+  return 0
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
