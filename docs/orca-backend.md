@@ -6,29 +6,49 @@ Firstmate agents operating this backend should load the agent-only [`firstmate-o
 
 ## Setup
 
-Pick Orca if you already run the Orca macOS app as your terminal environment and want firstmate tasks to live in Orca-managed worktrees and terminals instead of a treehouse/tmux pair.
-Orca is macOS-only, explicit-only (never auto-detected), and has no secondmate support.
+Pick Orca if you run the Orca app as your terminal environment and want firstmate tasks to live in Orca-managed worktrees and terminals instead of a treehouse/tmux pair.
+Orca runs in two shapes: the Orca desktop app on macOS, or a headless `orca serve` runtime on Linux.
+It is explicit-only (never auto-detected) and has no secondmate support.
 
 Prerequisites:
 
-- The Orca app installed at `/Applications/Orca.app`, and **running**.
-- The `orca` CLI: `brew install orca`.
+- The `orca` CLI on `PATH`, backed by a **running Orca runtime** reporting `reachable=true` and `state="ready"` - either the Orca desktop app on macOS or a headless `orca serve` process on Linux (see "Runtime shapes" below).
+  Note that `brew install orca` installs an unrelated package (Plotly's graphing library), not the Orca agentic CLI; install Orca from its own distribution.
 - `node`, used by firstmate's adapter to parse Orca's JSON output and to gate spawns on runtime readiness.
 - The universal firstmate prerequisites - a verified crew harness plus the required toolchain, owned by [`docs/configuration.md`](configuration.md) ("Harness support", "Toolchain") - with `orca` as the only backend-specific tool, since Orca replaces both the session multiplexer CLI and the `treehouse` worktree provider that the other backends require.
+
+### Runtime shapes
+
+Orca's runtime owns the project repos, worktrees, and terminals it creates, and firstmate's adapter assumes all of those share one filesystem view with the firstmate process: the recorded `worktree=` and `project=` paths are read as local paths, the crewmate brief is read by a local `cat`, and the harness runs off local `PATH`.
+Two runtime shapes satisfy that contract.
+
+**macOS desktop.**
+The Orca app runs as a GUI at `/Applications/Orca.app`; firstmate, the repos, and the worktrees all live on the same Mac.
+This is the shape the original adapter was built and smoke-verified against.
+
+**Linux headless (collocated).**
+Firstmate, the project clones, Orca worktrees, terminals, and a headless `orca serve` runtime all run on one Linux host.
+The Orca desktop app on a Mac, or a mobile client, may pair to that runtime as a viewer or interaction surface over the pairing address - it does not execute tasks, and firstmate never drives a remote runtime.
+Verified 2026-07-15 on `oracle-vps` (Linux aarch64, kernel `6.8.0-1054-oracle`) against Orca `1.4.141`: the runtime is installed under `/opt/Orca` (a full Linux build of the app), the `orca` CLI resolves through a wrapper at `~/.local/bin/orca` to `/opt/Orca/resources/bin/orca-ide`, and `orca serve` starts a runtime server without a desktop window.
+`orca serve --help` verbatim: *"Start an Orca runtime server without opening a desktop window"* and *"Use `--pairing-address` when clients should connect through a LAN, Tailscale, SSH-forward, or public tunnel address."*
+`orca status --json` reported `result.runtime.reachable=true`, `result.runtime.state="ready"`, and `result.app.running=true`.
+The runtime was supervised by a systemd user unit (`Restart=on-failure`, `RestartSec=5`, with `Linger=yes` so it survives SSH disconnects), launched as `orca-ide serve --port 6768 --pairing-address <tailscale-ip> --json`.
+Every lifecycle primitive firstmate's adapter calls - `status`, `repo add`, `worktree create`, `terminal create`, `terminal read`, `terminal send`, `terminal close`, `worktree rm` - returned the exact JSON shapes the adapter already parses, and the 50 fake-Orca tests in `tests/fm-backend-orca.test.sh` pass unchanged on Linux.
+The Orca adapter itself contains no macOS-specific assumptions (no `uname`, no `/Applications`, no `Darwin` checks), so the code that works on macOS is the same code that works on Linux.
 
 Select Orca by putting `orca` in a local `config/backend` file - the durable way to pick it - or by exporting `FM_BACKEND=orca` when you launch your harness for a one-off session; telling the first mate in chat to use Orca also works.
 It is never auto-detected.
 
-First run: before spawn mutates any repo or worktree state, firstmate runs `orca status --json` and requires the app to report `reachable=true` and `state="ready"` - start the Orca app and wait for it to finish loading before spawning.
+First run: before spawn mutates any repo or worktree state, firstmate runs `orca status --json` and requires the runtime to report `reachable=true` and `state="ready"` - start the Orca runtime (the desktop app on macOS, or `orca serve` on Linux) and wait for it to report ready before spawning.
 Spawn fails closed if the runtime is not ready.
 The first spawn against a given project also auto-registers that project's repo in Orca (`orca repo add --path`) if it is not already registered - no manual registration step is needed.
 
-Watching and attaching: Orca owns both the worktree and the terminal for its tasks, so there is nothing to attach to outside the Orca app itself - open the app and find the terminal for the task (recorded as `terminal=<handle>` in the task's meta, with `window=fm-<id>` as the shared firstmate alias).
+Watching and attaching: Orca owns both the worktree and the terminal for its tasks, so there is nothing to attach to outside Orca itself - open the Orca desktop app (when running) and find the terminal for the task (recorded as `terminal=<handle>` in the task's meta, with `window=fm-<id>` as the shared firstmate alias).
 You do not need to open the app for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's terminal without opening Orca, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it unless `FM_HOME` is already set to the active firstmate home (the stable `fm-<id>` alias also works; Enter and Ctrl-C are supported; Escape is not).
 
-Verify it works by spawning a trivial task with `--backend orca` and confirming the task's meta records `backend=orca`, `terminal=`, `orca_worktree_id=`, and `worktree=`; the Orca app should show a new terminal for the task.
+Verify it works by spawning a trivial task with `--backend orca` and confirming the task's meta records `backend=orca`, `terminal=`, `orca_worktree_id=`, and `worktree=`; Orca should show a new terminal for the task (visible in the desktop app when paired or running).
 
-Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semantics need a separate design), Escape is unsupported, Orca is macOS-only and explicit-only, and it exposes no stable CLI version marker, so spawn gates on runtime reachability instead of a version floor - see "Limitations" below for the complete list.
+Limitations: `--secondmate` spawns refuse `backend=orca` (secondmate-home semantics need a separate design), Escape is unsupported, Orca is explicit-only, and it exposes no stable CLI version marker, so spawn gates on runtime reachability instead of a version floor - see "Limitations" below for the complete list.
 
 ## Status
 
@@ -98,12 +118,18 @@ Teardown:
 - Escape is unsupported because the current Orca terminal send primitive exposes Enter and interrupt-style input but no verified Escape operation.
 - Orca is explicit-only and is not selected by runtime auto-detection.
 - Orca currently exposes no stable CLI version or protocol marker. Unlike the herdr/zellij/cmux docs, this backend intentionally gates spawn support on runtime reachability from `orca status --json` rather than a version floor.
+- `fm_backend_agent_alive` reports `unknown` for Orca (it has no native agent-liveness primitive), so the secondmate-liveness confident-respawn path does not apply to Orca tasks; this is pre-existing and not a regression of the Linux shape.
 
 ## Verification
 
-Real-Orca smoke verification was run against `/usr/local/bin/orca` with `/Applications/Orca.app` reporting bundle version `1.4.116`; `orca status --json` reported `result.runtime.reachable=true` and `result.runtime.state="ready"`.
+macOS desktop: real-Orca smoke verification was run against `/usr/local/bin/orca` with `/Applications/Orca.app` reporting bundle version `1.4.116`; `orca status --json` reported `result.runtime.reachable=true` and `result.runtime.state="ready"`.
 The verified terminal creation handle field is `result.terminal.handle` from `orca terminal create --json`; worktree creation returned `result.worktree.id` and `result.worktree.path` in the same smoke run.
 Firstmate intentionally ignores speculative terminal-handle shapes such as bare `result.id` and nested `result.worktree.terminal` until a real Orca smoke run proves them.
+
+Linux headless: the full lifecycle was exercised 2026-07-15 against `orca` `1.4.141` on `oracle-vps` (Linux aarch64, kernel `6.8.0-1054-oracle`), with the runtime headless under a systemd user unit running `orca-ide serve`.
+`orca status --json` reported `result.runtime.reachable=true`, `result.runtime.state="ready"`, and `result.app.running=true`.
+Real CLI calls against a throwaway repo confirmed every primitive the adapter calls: `orca repo add --path` (returned `result.repo.id`), `orca worktree create` (returned `result.worktree.id` and `result.worktree.path`), `orca terminal create` (returned `result.terminal.handle`), `orca terminal send` plus `orca terminal read` round-trip, `orca terminal close`, and `orca worktree rm` - all returning the JSON shapes the adapter parses.
+The 50 fake-Orca tests in `tests/fm-backend-orca.test.sh` pass unchanged on Linux, and the adapter has no macOS-specific code paths.
 
 Fake-Orca tests cover:
 

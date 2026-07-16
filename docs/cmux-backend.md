@@ -7,12 +7,13 @@ cmux is [a Ghostty-based macOS terminal](https://cmux.com) built for AI coding a
 Verified against the real installed app: cmux 0.64.17 (build 97), macOS aarch64.
 The feasibility investigation that preceded this build (`data/cmux-backend-feasibility-c7/report.md`) verified the app's CLI surface from source only, flagging a live install-and-poke pass as the remaining gate; that pass is what this document and `tests/fm-backend-cmux-smoke.test.sh` record.
 All real-cmux verification here and in the smoke test creates only `fm-test-`-prefixed task workspaces, with one documented exception: the manual last-in-window verification also creates the unnamed default sibling cmux requires to close that task workspace.
-It never enumerates-and-closes, touches no existing workspace, closes only its own `fm-test-` task workspaces, and never quits or relaunches the app - the same discipline `tests/herdr-test-safety.sh`/`tests/zellij-test-safety.sh` established for their backends, adapted in `tests/cmux-test-safety.sh` to cmux's shape (there is no isolated, throwaway session to spin up - cmux is one shared, GUI-first app instance, the same posture as Orca).
+It never enumerates-and-closes, touches no existing workspace, closes only its own `fm-test-` task workspaces, and never quits or relaunches the app - the same discipline `tests/herdr-test-safety.sh`/`tests/zellij-test-safety.sh` established for their backends, adapted in `tests/cmux-test-safety.sh` to cmux's shape (there is no isolated, throwaway session to spin up - cmux is one shared app instance, the same single-instance posture as Orca's runtime).
 
 ## Setup
 
 Pick cmux if you already run it as your terminal and want firstmate crew tabs to live there instead of tmux.
-cmux is **macOS-only** and **GUI-first** - selecting this backend means a real GUI window exists and is running, exactly like Orca's posture.
+cmux is **macOS-only** and **GUI-first** - selecting this backend means a real GUI window exists and is running.
+(This is stricter than Orca, which also runs headless on Linux via `orca serve`; cmux has no headless shape.)
 
 Prerequisites:
 
@@ -365,8 +366,9 @@ All three tasks' cmux workspaces and worktrees were confirmed fully cleaned up a
 ## Known gaps left for a follow-up
 
 - **No event push at all**, not even herdr's semantic busy-state: cmux has agent-awareness elsewhere (Claude Code hooks, session-resume) but nothing exposed over the socket API for generic busy/idle classification, so `fm-watch.sh`'s existing pane-hash + `FM_BUSY_REGEX` poll loop is the ONLY event source for this backend, identical to the tmux/zellij/Orca path.
-- **GUI-first, macOS-only, requires the app running** - identical posture to Orca.
-  Never a candidate for a headless/CI firstmate instance, because runtime auto-detection (cmux runtime signals; see "Runtime auto-detection" above) can only fire from inside a live cmux terminal in the first place.
+- **GUI-first, macOS-only, requires the app running.**
+  cmux itself has no headless or Linux runtime, so it is never a candidate for a headless/CI/SSH-only firstmate instance (unlike Orca, which also runs headless on Linux via `orca serve`).
+  Runtime auto-detection (cmux runtime signals; see "Runtime auto-detection" above) can only fire from inside a live cmux terminal in the first place.
   The one-time socket-access setup remains an unavoidable manual step regardless of how the backend was selected.
 - **`--secondmate` spawns are refused** (mirrors Orca's refusal) - no per-home container design (a herdr-style workspace-per-home split, or similar) has been designed or verified for cmux yet.
 - **The one-time socket-access setup is a real, undocumented-by-upstream onboarding step.** A captain who selects `backend=cmux` without first switching `automation.socketControlMode` away from its `cmuxOnly` default to a viable mode (Automation mode recommended; see "Setup") will see every spawn fail with an actionable error naming the viable modes and pointing back to this document, but there is no way for firstmate to complete that GUI-only setup step on the captain's behalf.

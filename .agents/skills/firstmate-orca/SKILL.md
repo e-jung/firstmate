@@ -28,7 +28,7 @@ If `FM_HOME` is set, remember that operational state lives under `$FM_HOME` whil
 Before switching or spawning against Orca:
 
 - Confirm Orca is intentionally selected through `--backend orca`, `FM_BACKEND=orca`, or local `config/backend`.
-- Confirm the Orca app is running and the backend readiness checks pass before expecting spawn to work.
+- Confirm the Orca runtime is running (the desktop app on macOS, or `orca serve` on Linux) and the backend readiness checks pass before expecting spawn to work.
 - Inspect active `state/*.meta` records before changing backend selection.
 - Treat a backend switch as affecting future spawns only; existing tasks keep their recorded backend.
 - Reconcile watcher wakes before unrelated work, especially if Orca tasks are already in flight.
