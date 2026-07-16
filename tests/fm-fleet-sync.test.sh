@@ -603,6 +603,224 @@ test_non_signature_fetch_failure_is_not_retried() {
   pass "a non-packed-refs.lock fetch failure keeps today's behavior (no retry)"
 }
 
+# --- fork-sync tests --------------------------------------------------------
+#
+# sync_fork_default fast-forwards a no-mistakes gate fork's default branch from
+# its upstream parent (via the merge-upstream API) and refreshes the gate
+# bare-repo's origin/<default> ref. These tests pin the fork-detection +
+# fast-forward-only decision logic using a mock gh, without hitting GitHub.
+
+# build_forked_project <home> <name>: creates a project clone wired like a real
+# no-mistakes gate setup:
+#   - clone origin      = upstream bare repo (at C0)
+#   - clone no-mistakes  = gate bare repo
+#   - gate origin        = https://github.com/testowner/testrepo.git (fake fork URL)
+#   - gate url.insteadOf  redirects that fake URL to a local fork bare repo
+#   - fork                = bare clone of upstream at C0
+# The fork's work repo lives at $home/work-fork-<name> (push there to advance it).
+# Echoes the clone path.
+build_forked_project() {
+  local home=$1 name=$2
+  local up_work up_git fork_git fork_work gate_git clone up_abs fork_abs
+  up_work="$home/work-up-$name"
+  up_git="$home/up-$name.git"
+  fork_git="$home/fork-$name.git"
+  fork_work="$home/work-fork-$name"
+  gate_git="$home/gate-$name.git"
+  clone="$home/projects/$name"
+  mkdir -p "$home/projects"
+
+  git init -q "$up_work"
+  git -C "$up_work" symbolic-ref HEAD refs/heads/main
+  commit_file "$up_work" file.txt v0 C0
+  git clone --quiet --bare "$up_work" "$up_git"
+  up_abs=$(cd "$up_git" && pwd)
+  git -C "$up_work" remote add origin "file://$up_abs"
+  git -C "$up_work" push -q -u origin main
+
+  git clone --quiet --bare "file://$up_abs" "$fork_git"
+  fork_abs=$(cd "$fork_git" && pwd)
+  git clone --quiet "file://$fork_abs" "$fork_work"
+
+  git clone --quiet --bare "file://$fork_abs" "$gate_git"
+  git -C "$gate_git" remote set-url origin "https://github.com/testowner/testrepo.git"
+  git -C "$gate_git" config "url.file://$fork_abs.insteadOf" "https://github.com/testowner/testrepo.git"
+  git -C "$gate_git" fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+
+  git clone --quiet "file://$up_abs" "$clone"
+  git -C "$clone" remote add no-mistakes "$gate_git"
+  printf '%s\n' "$clone"
+}
+
+# write_mock_gh <fakebin>: drop a mock gh that responds to the three API calls
+# sync_fork_default makes. Controlled by env vars:
+#   GH_FORK       - "true"/"false" (is the repo a fork)
+#   GH_PARENT     - parent full_name
+#   GH_DEFAULT    - default branch
+#   GH_COMPARE    - compare status (behind|identical|diverged|ahead)
+#   GH_MERGE_TYPE - merge_type result (fast-forward|merge|none)
+#   GH_MERGE_FAIL - if set, merge-upstream exits 1
+#   GH_MERGE_LOG  - file touched when merge-upstream is called
+write_mock_gh() {
+  cat > "$1/gh" <<'SH'
+#!/usr/bin/env bash
+path=
+for a in "$@"; do
+  case "$a" in /*) path=$a; break ;; esac
+done
+case "$path" in
+  */merge-upstream)
+    [ -n "${GH_MERGE_LOG:-}" ] && : >> "$GH_MERGE_LOG"
+    if [ -n "${GH_MERGE_FAIL:-}" ]; then
+      printf '%s\n' "HTTP 409: merge conflict (mocked)" >&2
+      exit 1
+    fi
+    printf '%s\n' "${GH_MERGE_TYPE:-fast-forward}"
+    ;;
+  */compare/*)
+    comp=${path##*/compare/}; cb=${comp%%...*}; ch=${comp#*...}
+    case "$cb" in *:*) ;; *) printf 'mock gh: compare base must be owner:branch: %s\n' "$comp" >&2; exit 1 ;; esac
+    case "${cb%%:*}" in */*) printf 'mock gh: compare base must be owner:branch, not owner/repo:branch: %s\n' "$comp" >&2; exit 1 ;; esac
+    case "$ch" in *:*) printf 'mock gh: compare head must be the fork bare branch: %s\n' "$comp" >&2; exit 1 ;; esac
+    printf '%s\n' "${GH_COMPARE:-behind}"
+    ;;
+  /repos/*)
+    printf '%s\t%s\t%s\n' "${GH_FORK:-true}" "${GH_PARENT:-upstream-owner/testrepo}" "${GH_DEFAULT:-main}"
+    ;;
+  *)
+    printf 'mock gh: unexpected path: %s\n' "$path" >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$1/gh"
+}
+
+# run_sync_fork <home> <fakebin> [args...]: run fleet-sync with the mock gh.
+run_sync_fork() {
+  local home=$1 fakebin=$2
+  shift 2
+  PATH="$fakebin:$PATH" \
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-fleet-sync.sh" "$@" 2>/dev/null
+}
+
+test_fork_behind_syncs() {
+  local home fakebin clone out fork_work gate merge_log fork_main gate_main
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forksync)
+  fork_work="$home/work-fork-forksync"
+  gate="$home/gate-forksync.git"
+  merge_log="$home/merge-forksync"
+
+  commit_file "$fork_work" file.txt v1 C1
+  git -C "$fork_work" push -q origin main
+  fork_main=$(git -C "$fork_work" rev-parse main)
+
+  out=$(GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forksync)
+
+  assert_contains "$out" "forksync: fork-synced:" "behind fork should report synced"
+  assert_contains "$out" "upstream-owner/testrepo" "synced line names the parent"
+  [ -f "$merge_log" ] || fail "merge-upstream was not called for a behind fork"
+  gate_main=$(git -C "$gate" rev-parse refs/remotes/origin/main)
+  [ "$gate_main" = "$fork_main" ] || fail "gate origin/main was not refreshed to fork's main"
+  pass "a behind fork is fast-forwarded and the gate ref is refreshed"
+}
+
+test_fork_diverged_skips_merge_upstream() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forkdiv)
+  merge_log="$home/merge-forkdiv"
+
+  out=$(GH_COMPARE=diverged GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forkdiv)
+
+  assert_contains "$out" "forkdiv: fork-sync: skipped: diverged" "diverged fork should report skipped"
+  [ ! -f "$merge_log" ] || fail "merge-upstream was called for a diverged fork"
+  pass "a diverged fork is skipped and merge-upstream is never called"
+}
+
+test_non_fork_silently_ignored() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forknon)
+  merge_log="$home/merge-forknon"
+
+  out=$(GH_FORK=false GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forknon)
+
+  assert_not_contains "$out" "fork-sync" "non-fork should produce no fork-sync line"
+  [ ! -f "$merge_log" ] || fail "merge-upstream was called for a non-fork"
+  pass "a non-fork repo is silently ignored (no fork-sync output)"
+}
+
+test_fork_already_current_no_merge_upstream() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forkcur)
+  merge_log="$home/merge-forkcur"
+
+  out=$(GH_COMPARE=identical GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forkcur)
+
+  assert_contains "$out" "forkcur: fork-sync: already current" "identical fork should report already current"
+  [ ! -f "$merge_log" ] || fail "merge-upstream was called for an already-current fork"
+  pass "an already-current fork reports 'already current' without calling merge-upstream"
+}
+
+test_fork_merge_upstream_failure_skips() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forkfail)
+  merge_log="$home/merge-forkfail"
+
+  out=$(GH_MERGE_FAIL=1 GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forkfail)
+
+  assert_contains "$out" "forkfail: fork-sync: skipped: merge-upstream failed" "failed merge-upstream should report skipped"
+  [ -f "$merge_log" ] || fail "merge-upstream marker not touched despite GH_MERGE_FAIL"
+  pass "a merge-upstream failure is reported and skipped"
+}
+
+test_fork_sync_disabled_by_env() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forkoff)
+  merge_log="$home/merge-forkoff"
+
+  out=$(FM_FORK_SYNC=0 GH_MERGE_LOG="$merge_log" run_sync_fork "$home" "$fakebin" forkoff)
+
+  assert_not_contains "$out" "fork-sync" "FM_FORK_SYNC=0 should suppress all fork-sync output"
+  [ ! -f "$merge_log" ] || fail "merge-upstream was called despite FM_FORK_SYNC=0"
+  pass "FM_FORK_SYNC=0 disables fork sync entirely"
+}
+
+test_bootstrap_relays_fork_sync_diverged() {
+  local home fakebin clone out merge_log
+  home=$(new_home)
+  fakebin="$home/fb"; mkdir -p "$fakebin"
+  write_mock_gh "$fakebin"
+  clone=$(build_forked_project "$home" forkrelay)
+  merge_log="$home/merge-forkrelay"
+
+  out=$(GH_COMPARE=diverged GH_MERGE_LOG="$merge_log" \
+    PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_contains "$out" "FLEET_SYNC: forkrelay: fork-sync: skipped: diverged" \
+    "bootstrap relays the fork-sync diverged line"
+  pass "bootstrap relays fork-sync diverged as a FLEET_SYNC line"
+}
+
 test_detached_clean_ancestor_recovers
 test_detached_unique_commit_is_stuck_untouched
 test_detached_clean_ancestor_with_diverged_local_default_is_stuck_untouched
@@ -625,3 +843,10 @@ test_live_packed_refs_lock_is_never_removed
 test_live_git_cwd_in_clone_dir_blocks_removal
 test_transient_packed_refs_lock_self_clears
 test_non_signature_fetch_failure_is_not_retried
+test_fork_behind_syncs
+test_fork_diverged_skips_merge_upstream
+test_non_fork_silently_ignored
+test_fork_already_current_no_merge_upstream
+test_fork_merge_upstream_failure_skips
+test_fork_sync_disabled_by_env
+test_bootstrap_relays_fork_sync_diverged

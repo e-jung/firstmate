@@ -35,6 +35,27 @@ On timeout or daemon shutdown, its watchdog terminates the notifier group, logs 
 The AppleScript passes the summary as an `argv` item rather than interpolating it into the script source, so summary text can never break the notification.
 See `docs/examples/wedge-alarm` for a copyable starting config.
 
+## Early-wedge triggers (never blind again)
+
+`inject_wedge_alarm` is the SINGLE alarm path for every wake-path failure trigger.
+Three distinct triggers feed it, each catching a different failure shape; whichever fires first writes the `state/.subsuper-inject-wedged` marker, and that marker (plus an in-process epoch) is the one dedup window across all three, so two triggers never double-fire within one `FM_MAX_DEFER_SECS` window.
+All three are gated on `state/.afk` presence: a strict no-op when away mode is off.
+The captain DEFERRED the out-of-band phone/OS alert channel, so every trigger routes only through the existing `wedge_alarm_notify` channels above plus the durable marker - no new notification channel was added.
+
+1. **Max-defer** (the original time-bound trigger): if a buffered escalation stays undelivered past `FM_MAX_DEFER_SECS` (default 300; `0` disables), the daemon retries one normal delivery and, if it still cannot confirm a submit, raises the alarm.
+
+2. **Defer-streak** (count-bound early signal, `FM_DEFER_STREAK_MAX`, default 8; `0` disables): a rising streak of inject deferrals on an IDLE (not-busy) pane is a classifier failure - the exact signature of the U+00A0 / ghost-text incidents, where an idle composer is misread as pending so every flush defers.
+   A confirmed delivery or a BUSY-pane defer (the agent is genuinely mid-turn) resets the streak; any other defer (composer guard, unconfirmed submit, gone target) on an away-active daemon increments it.
+   When the streak reaches the threshold it raises the same alarm once per deferral episode (a fired sentinel suppresses re-fires as the streak keeps climbing).
+   This is the only trigger when `FM_MAX_DEFER_SECS=0`, and it complements max-defer on a count bound instead of a time bound.
+
+3. **Wake-path canary** (`FM_CANARY_INTERVAL_SECS`, default 900; `0` disables): a periodic no-inject probe of the FULL supervisor wake path that is implementation-blind - it catches a broken path regardless of why (the next composer misclassification, a phantom target, a swallowed class the daemon has not met yet).
+   On each interval the daemon exercises the same target/busy/composer primitives `inject_msg`'s guard chain uses, but it only READS (it never types or submits, so it cannot inject visible junk into the pane), and classifies:
+   - **healthy** - target present AND (the pane is busy, OR the composer is affirmatively empty, meaning an inject would land).
+   - **broken** - the target is gone, OR an idle (not-busy) pane has a composer that is NOT affirmatively empty (`pending` = the classifier-wedge signature; `unknown` = a dead shell or unreadable pane).
+   On broken it raises the alarm and writes the marker.
+   A canary probe runs once at daemon startup (the first housekeeping tick) and then every interval.
+
 ## Test safety: no test posts a real notification
 
 Every notifier channel (`osascript`, `herdr`, and `command:`) routes through a single seam, `FM_WEDGE_ALARM_EXEC`: when it is set, the daemon hands the fixed channel category and summary to that command instead of the real notifier (`wedge_alarm_emit` in `bin/fm-supervise-daemon.sh`).

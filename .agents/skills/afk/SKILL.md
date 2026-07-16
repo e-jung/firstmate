@@ -109,6 +109,7 @@ an ERROR in the daemon log, a durable
 catch-up if present), a tmux status-line flash when applicable, and a configurable backend-independent active alert.
 `docs/wedge-alarm.md` owns the alert channel setup and verification record.
 So a guard false-positive becomes a visible stall, never an unbounded silent no-op.
+Two early-wedge triggers raise the SAME alarm BEFORE `FM_MAX_DEFER_SECS`, so a broken wake path surfaces fast instead of waiting out the full timeout: `FM_DEFER_STREAK_MAX` (default 8) fires after that many consecutive non-busy inject deferrals — a rising idle-pane streak is the classifier-failure signature — and the read-only wake-path canary (`FM_CANARY_INTERVAL_SECS`, default 900) probes the full target/busy/composer path on its own cadence. `docs/wedge-alarm.md` owns both.
 
 ## Submit model
 
@@ -141,7 +142,7 @@ Classify each wake this way:
   -> self-handle. Captain-relevant verb -> escalate.
 - `signal` or `stale` for a declared `paused:` external wait -> self-handle and track the pause rather than a wedge.
   If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one awaiting-external recheck and resets the pause window.
-- `check` -> always escalate. Check scripts print only when firstmate should wake.
+- `check` -> always escalate. The watcher emits a check wake only for a genuine state change (deduped steady-state output) or a swallowed terminal transition (catch-all), so it is always actionable.
 - `stale` with a terminal status -> escalate. Non-terminal stale is transient:
   record a marker and self-handle. If the pane is still idle past
   `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a

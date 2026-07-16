@@ -19,6 +19,12 @@
 # killed mid-write - e.g. a timed-out bootstrap sync or a teardown process kill),
 # it is retried with a bounded wait and removed only when provably stale; see
 # fetch_with_packed_refs_lock_guard and the FM_FLEET_SYNC_PACKED_REFS_LOCK_* knobs.
+# Also fast-forwards a no-mistakes gate fork's default branch from its upstream
+# parent (merge-upstream API) and refreshes the gate bare-repo's origin/<default>
+# ref, so the gate never compares against a stale fork main. Fast-forward only:
+# the compare API confirms the fork is strictly behind before any write, so a
+# diverged fork (with unique commits) is skipped, never force-synced. Set
+# FM_FORK_SYNC=0 to disable; see sync_fork_default.
 # Usage: fm-fleet-sync.sh [<project-dir-or-name>]
 # The single-project form accepts either a path (absolute, or relative to the
 # caller's cwd) or a bare "<name>"/"projects/<name>" form, resolved against
@@ -289,6 +295,111 @@ report_stuck() {
   echo "$label: STUCK: on $state, $behind commits behind $BASE - needs attention"
 }
 
+# Extract "owner/repo" from a GitHub remote URL (https or ssh). Returns 1 when
+# the URL is not a GitHub repo URL or does not resolve to a clean owner/repo.
+parse_github_owner_repo() {
+  local url=$1 hostless
+  url="${url%.git}"
+  url="${url%/}"
+  case "$url" in
+    *github.com*) ;;
+    *) return 1 ;;
+  esac
+  hostless="${url#*github.com}"
+  hostless="${hostless#:}"
+  hostless="${hostless#/}"
+  case "$hostless" in
+    */*/*) return 1 ;;
+    */*) printf '%s\n' "$hostless" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Fast-forward a no-mistakes gate fork's default branch from its upstream parent,
+# then refresh the gate bare-repo's origin/<default> ref so the gate compares
+# against the true upstream base instead of a stale fork main.
+#
+# Safety: fast-forward only. The compare API confirms the fork is strictly
+# behind before calling merge-upstream, so a diverged fork (with unique commits)
+# is skipped - never force-synced, never merge-committed. If merge-upstream
+# returns a non-fast-forward result despite the pre-check (a TOCTOU race), it is
+# reported and the gate ref is left as-is for manual inspection.
+# Best-effort and non-fatal: any failure (offline, API error, rate limit) is
+# reported and skipped; it never blocks the clone sync or session start.
+# Reads $PROJ (the clone) and $label (the project label) from the caller.
+# Output lines mirror the clone sync's "$label: ..." convention; bootstrap relays
+# the "skipped:" cases as FLEET_SYNC lines.
+sync_fork_default() {
+  [ "${FM_FORK_SYNC:-1}" != "0" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  local bare_repo fork_url owner_repo fork_info rest is_fork parent parent_owner default
+  local compare_status merge_type refspec before after
+
+  # Resolve the no-mistakes gate bare repo from the clone's remote.
+  bare_repo=$(git -C "$PROJ" remote get-url no-mistakes 2>/dev/null) || return 0
+  [ -d "$bare_repo" ] || return 0
+
+  # The bare repo's origin is the fork (e.g. the captain's fork of upstream).
+  # Read the raw config value, not `remote get-url`, so url.insteadOf rewrites
+  # (e.g. ssh->https) do not alter what we parse as the fork identity.
+  fork_url=$(git -C "$bare_repo" config --get remote.origin.url 2>/dev/null) || return 0
+  owner_repo=$(parse_github_owner_repo "$fork_url") || return 0
+
+  # Determine fork status, parent, and default branch in one API call.
+  fork_info=$(gh api "/repos/$owner_repo" \
+    --jq '[.fork, .parent.full_name // "", .default_branch // ""] | @tsv' 2>/dev/null) || {
+    echo "$label: fork-sync: skipped: cannot read repo info for $owner_repo"
+    return 0
+  }
+  is_fork=${fork_info%%$'\t'*}
+  rest=${fork_info#*$'\t'}
+  parent=${rest%%$'\t'*}
+  default=${rest#*$'\t'}
+  # Non-fork repos are silently ignored (no gate-fork to sync).
+  [ "$is_fork" = "true" ] && [ -n "$parent" ] && [ -n "$default" ] || return 0
+  parent_owner=${parent%%/*}
+
+  # Confirm the fork is strictly behind before writing (fast-forward only).
+  compare_status=$(gh api "/repos/$owner_repo/compare/$parent_owner:$default...$default" \
+    --jq '.status' 2>/dev/null) || {
+    echo "$label: fork-sync: skipped: cannot compare $owner_repo with $parent"
+    return 0
+  }
+  case "$compare_status" in
+    behind) ;;
+    identical)
+      echo "$label: fork-sync: already current with $parent"
+      return 0
+      ;;
+    *)
+      echo "$label: fork-sync: skipped: diverged from $parent ($compare_status)"
+      return 0
+      ;;
+  esac
+
+  before=$(git -C "$bare_repo" rev-parse --short "refs/remotes/origin/$default" 2>/dev/null) || before="?"
+
+  if ! merge_type=$(gh api --method POST "/repos/$owner_repo/merge-upstream" \
+      --field "branch=$default" --jq '.merge_type' 2>&1); then
+    echo "$label: fork-sync: skipped: merge-upstream failed: $(first_line "$merge_type")"
+    return 0
+  fi
+  if [ "$merge_type" != "fast-forward" ]; then
+    echo "$label: fork-sync: skipped: merge-upstream returned $merge_type (expected fast-forward)"
+    return 0
+  fi
+
+  # Refresh the gate bare-repo's origin/<default> so the gate sees the new base.
+  refspec="+refs/heads/$default:refs/remotes/origin/$default"
+  if ! git -C "$bare_repo" fetch origin "$refspec" --quiet 2>/dev/null; then
+    echo "$label: fork-sync: skipped: fork synced but gate ref refresh failed"
+    return 0
+  fi
+  after=$(git -C "$bare_repo" rev-parse --short "refs/remotes/origin/$default" 2>/dev/null) || after="?"
+  echo "$label: fork-synced: $parent $before..$after"
+}
+
 sync_project() {
   PROJ=$1
   label=$(project_label)
@@ -311,6 +422,11 @@ sync_project() {
     echo "$label: skipped: no origin remote"
     return 0
   fi
+
+  # Fast-forward the gate fork's default branch from its upstream parent so the
+  # no-mistakes gate never compares against a stale fork main. Best-effort;
+  # runs before the clone fetch so the fork is current when the clone pulls.
+  sync_fork_default || true
 
   if ! fetch_with_packed_refs_lock_guard; then
     reason="fetch failed"

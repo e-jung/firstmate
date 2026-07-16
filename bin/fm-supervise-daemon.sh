@@ -102,6 +102,20 @@
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
+#          FM_DEFER_STREAK_MAX      early-wedge trigger: after this many
+#                                   CONSECUTIVE non-busy inject deferrals on a
+#                                   still-pending escalation, raise the same
+#                                   wedge alarm (a rising idle-pane defer streak
+#                                   is a classifier failure). A confirmed
+#                                   delivery or a busy-pane defer resets the
+#                                   streak. Deduped with the max-defer alarm via
+#                                   the shared marker window (default 8; 0
+#                                   disables). See defer_streak_observe.
+#          FM_CANARY_INTERVAL_SECS  early-wedge trigger: cadence for a periodic
+#                                   no-inject probe of the full supervisor wake
+#                                   path that alarms when an idle pane cannot
+#                                   confirm an inject would land (default 900; 0
+#                                   disables). See wake_canary.
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -186,6 +200,16 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # the normal flush path and, if that cannot confirm a submit, raises a loud wedge
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
 MAX_DEFER_SECS_DEFAULT=300
+# Early-wedge signals that fire the SAME inject_wedge_alarm as max-defer but on a
+# different trigger, so a broken wake path is loud and fast instead of silent:
+#   - defer-streak: N CONSECUTIVE non-busy inject deferrals on a still-pending
+#     escalation (a rising streak on an idle pane is a classifier failure). 0
+#     disables. See defer_streak_observe.
+#   - canary: a periodic no-inject probe of the full supervisor wake path (target
+#     + busy + composer reads) that alarms when an idle pane cannot confirm an
+#     inject would land. 0 disables. See wake_canary.
+DEFER_STREAK_MAX_DEFAULT=8
+CANARY_INTERVAL_SECS_DEFAULT=900
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -384,7 +408,7 @@ classify_stale() {  # <window> <state>
   printf 'self|transient stale (%s): %s' "$win" "${last:-no status}"
 }
 
-classify_check() {  # <full reason>  — check scripts print only when firstmate should wake
+classify_check() {  # <full reason>  — the watcher emits a check wake only for a real change or swallowed transition
   printf 'escalate|%s' "$1"
 }
 
@@ -854,8 +878,19 @@ wedge_alarm_notify() {  # <summary> <marker>
 # configurable backend-independent active alert (wedge_alarm_notify). Nothing
 # is lost - the buffer and the
 # wake-queue both survive - but the stall stops being invisible.
-inject_wedge_alarm() {  # <state> <age-seconds>
-  local state=$1 age=$2 marker target backend max_defer now notify=1
+#
+# This is the SINGLE alarm path for every wake-path failure trigger: the
+# max-defer timeout, the defer-streak early signal, and the canary all route
+# through here. The shared marker-mtime + WEDGE_ALARM_LAST_EPOCH throttle below
+# is therefore the one dedup window across all three: whichever fires first
+# writes the marker and suppresses the others for one max-defer window, so two
+# triggers never double-fire. An optional <tag> (defer-streak/canary) replaces
+# the default "escalation undelivered" wording so the marker and alert name the
+# trigger that actually fired; callers that omit it (max-defer, existing tests)
+# get the original message byte-for-byte.
+inject_wedge_alarm() {  # <state> <age-seconds> [reason-tag]
+  local state=$1 age=$2 tag=${3:-} marker target backend max_defer now notify=1
+  local summary tmux_msg marker_head marker_body
   marker="$state/.subsuper-inject-wedged"
   max_defer="${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}"
   # Re-alarm at most once per max-defer window so a long wedge does not spam.
@@ -867,11 +902,21 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     notify=0
   else
     WEDGE_ALARM_LAST_EPOCH=$now
-    log "ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
+    if [ -n "$tag" ]; then
+      log "ERROR: away-mode wake path WEDGED (${tag}) after ${age}s; inject could not confirm a submit. Buffer + wake-queue preserved; alarm marker written."
+    else
+      log "ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
+    fi
+  fi
+  if [ -n "$tag" ]; then
+    marker_head=$(printf 'fm away-mode wake path WEDGED (%s) after %ss as of %s\n' "$tag" "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+    marker_body='The supervisor wake path could not confirm a submit would land.'
+  else
+    marker_head=$(printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+    marker_body='The supervisor pane could not accept an escalation. Buffered items:'
   fi
   {
-    printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
+    printf '%s\n%s\n' "$marker_head" "$marker_body"
     cat "$state/.subsuper-escalations" 2>/dev/null
   } 2>/dev/null > "$marker" || true
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
@@ -881,7 +926,12 @@ inject_wedge_alarm() {  # <state> <age-seconds>
   # the primary, backend-independent signal, so a non-tmux backend just skips
   # this cosmetic extra rather than attempting an unsupported call.
   if [ "$backend" = tmux ]; then
-    tmux display-message -t "$target" "fm: away-mode escalations WEDGED ${age}s — see $marker" 2>/dev/null || true
+    if [ -n "$tag" ]; then
+      tmux_msg="fm: away-mode wake path WEDGED (${tag}) ${age}s — see $marker"
+    else
+      tmux_msg="fm: away-mode escalations WEDGED ${age}s — see $marker"
+    fi
+    tmux display-message -t "$target" "$tmux_msg" 2>/dev/null || true
   fi
   # Backend-independent active alert. Unlike the tmux flash above (skipped on
   # every non-tmux backend), this can reach the captain even when every pane and
@@ -889,7 +939,12 @@ inject_wedge_alarm() {  # <state> <age-seconds>
   # incident fell through. Configurable and best-effort; the marker above stays
   # the durable record whether or not any channel fires.
   if [ "$notify" -eq 1 ]; then
-    wedge_alarm_notify "away-mode escalations WEDGED ${age}s undelivered - see $marker" "$marker"
+    if [ -n "$tag" ]; then
+      summary="away-mode wake path WEDGED (${tag}) ${age}s - see $marker"
+    else
+      summary="away-mode escalations WEDGED ${age}s undelivered - see $marker"
+    fi
+    wedge_alarm_notify "$summary" "$marker"
   fi
 }
 
@@ -904,13 +959,141 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
   fi
 }
 
+# --- early-wedge safeguard 1: defer-streak alarm ----------------------------
+# A rising streak of inject deferrals on an IDLE (not-busy) pane is a classifier
+# failure (the U+00A0 / ghost-text incidents: an idle composer misread as
+# pending, so every flush defers). max-defer catches the same wedge on a TIME
+# bound; this catches it on a COUNT bound, and is the only trigger when
+# FM_MAX_DEFER_SECS=0. A confirmed delivery or a busy-pane defer (the pane is
+# genuinely in use) resets the streak. At FM_DEFER_STREAK_MAX consecutive
+# non-busy deferrals it raises the wedge alarm via the shared inject_wedge_alarm
+# path, which dedupes with the max-defer alarm within one marker window.
+#
+# Streak state (durable so a daemon restart keeps the count):
+#   state/.subsuper-defer-streak          current consecutive-defer count
+#   state/.subsuper-defer-streak-fired    sentinel: alarm fired this episode
+# (cleared together on any reset, so one deferral episode alarms at most once).
+_defer_streak_read() {  # <state> -> count
+  local f="$1/.subsuper-defer-streak"
+  [ -r "$f" ] && cat "$f" 2>/dev/null || printf '0'
+}
+
+_defer_streak_reset() {  # <state>
+  rm -f "$1/.subsuper-defer-streak" "$1/.subsuper-defer-streak-fired"
+}
+
+# defer_streak_observe <state> <reason> <oldest-age-secs>: account for one flush
+# outcome. <reason> is the FM_INJECT_LAST_REASON inject_msg set (empty for a
+# confirmed delivery; busy/gone/composer/submit/afk for a defer).
+defer_streak_observe() {  # <state> <reason> <oldest-age-secs>
+  local state=$1 reason=$2 age=$3 max n fired
+  afk_active "$state" || { _defer_streak_reset "$state"; return 0; }
+  # A confirmed delivery (empty reason) or a BUSY defer (healthy: the pane is
+  # genuinely in use) breaks the streak.
+  case "$reason" in
+    ''|busy) _defer_streak_reset "$state"; return 0 ;;
+  esac
+  n=$(( $(_defer_streak_read "$state") + 1 ))
+  printf '%s' "$n" > "$state/.subsuper-defer-streak"
+  max=${FM_DEFER_STREAK_MAX:-$DEFER_STREAK_MAX_DEFAULT}
+  [ "$max" -gt 0 ] || return 0   # 0 disables the streak trigger
+  fired="$state/.subsuper-defer-streak-fired"
+  # Fire at most once per deferral episode (the sentinel suppresses re-fires as
+  # the streak keeps climbing; inject_wedge_alarm's own marker window is the
+  # cross-trigger dedup with max-defer and the canary).
+  if [ "$n" -ge "$max" ] && [ ! -e "$fired" ]; then
+    : > "$fired"
+    inject_wedge_alarm "$state" "$age" "defer-streak=${n}"
+  fi
+}
+
+# _flush_and_observe <state>: flush the escalation buffer if it has content and
+# feed the outcome to the defer-streak tracker. Returns the flush exit code.
+_flush_and_observe() {  # <state>
+  local state=$1 rc age
+  [ -s "$state/.subsuper-escalations" ] || return 0
+  age=$(_oldest_line_age "$state/.subsuper-escalations")
+  FM_INJECT_LAST_REASON=
+  rc=0; escalate_flush "$state" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    defer_streak_observe "$state" "" "$age"
+  else
+    defer_streak_observe "$state" "${FM_INJECT_LAST_REASON:-unknown}" "$age"
+  fi
+  return "$rc"
+}
+
+# --- early-wedge safeguard 2: end-to-end wake-path canary -------------------
+# A periodic no-inject probe of the FULL supervisor wake path. It exercises the
+# same target/busy/composer primitives inject_msg's guard chain uses and
+# classifies the result:
+#   healthy: target present AND (busy OR composer affirmatively empty). A busy
+#            pane is a legitimate defer (the agent is mid-turn); an empty pane
+#            means an inject WOULD land. Either way the path works.
+#   broken:  target gone, OR an idle (not-busy) pane whose composer is NOT
+#            affirmatively empty (pending = the classifier-wedge signature;
+#            unknown = a dead shell or unreadable pane).
+# On broken it raises the wedge alarm + writes the durable marker via the shared
+# inject_wedge_alarm path. The canary NEVER types or submits (no send-keys), so
+# it cannot inject visible junk; it only READS (capture/composer-state). Strict
+# no-op when afk is off. Cadence FM_CANARY_INTERVAL_SECS (default 900); 0
+# disables. Implementation-blind: it catches a broken path regardless of WHY
+# (the next composer misclassification, a phantom target, a swallowed class).
+wake_canary() {  # <state>
+  local state=$1 interval target backend composer verdict age
+  afk_active "$state" || return 0
+  interval=${FM_CANARY_INTERVAL_SECS:-$CANARY_INTERVAL_SECS_DEFAULT}
+  [ "$interval" -gt 0 ] || return 0
+  [ "$(_file_age "$state/.subsuper-last-canary")" -ge "$interval" ] || return 0
+  _now > "$state/.subsuper-last-canary"
+  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
+  if ! fm_backend_target_exists "$backend" "$target"; then
+    verdict="broken: supervisor target gone"
+  elif pane_is_busy "$target" "$backend"; then
+    # A busy pane is a legitimate defer (agent mid-turn). pane_is_busy checks the
+    # native busy-state primitive first, then the capture+regex fallback (tmux has
+    # no native busy primitive), so a tmux busy footer reads healthy here exactly
+    # as inject_msg's guard would.
+    verdict="healthy: pane busy (legitimate defer)"
+  else
+    composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
+    case "$composer" in
+      empty) verdict="healthy: composer empty (inject would land)" ;;
+      pending) verdict="broken: idle pane, composer pending (classifier wedge)" ;;
+      *) verdict="broken: idle pane, composer ${composer:-unknown} (dead shell / unreadable)" ;;
+    esac
+  fi
+  case "$verdict" in
+    broken:*)
+      # The age is cosmetic (message text). Use the real undelivered age when
+      # there is buffered work; otherwise the canary interval stands in for
+      # "broken for at least one probe period".
+      if [ -s "$state/.subsuper-escalations" ]; then
+        age=$(_oldest_line_age "$state/.subsuper-escalations")
+      else
+        age=$interval
+      fi
+      log "wake-path canary: $verdict"
+      inject_wedge_alarm "$state" "$age" "canary: ${verdict#broken: }"
+      ;;
+    healthy:*)
+      log "wake-path canary: $verdict"
+      ;;
+  esac
+}
+
 # --- housekeeping (runs every tick while the watcher is mid-cycle) ----------
-# Four cheap jobs, each guarded so an empty/quiet fleet costs near zero:
+# Cheap jobs, each guarded so an empty/quiet fleet costs near zero:
 #  1) batch flush: if the escalation buffer's oldest content is older than
-#     ESCALATE_BATCH_SECS (or batching is disabled), inject one digest.
+#     ESCALATE_BATCH_SECS (or batching is disabled), inject one digest. Each
+#     flush outcome feeds the defer-streak tracker (_flush_and_observe).
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
+#  1c) wake-path canary: every FM_CANARY_INTERVAL_SECS, a no-inject probe of the
+#     full supervisor wake path that alarms when an idle pane cannot confirm an
+#     inject would land (wake_canary).
 #  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
 #     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
@@ -923,19 +1106,20 @@ housekeeping() {  # <state>
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
-  # (1) batch flush
+  # (1) batch flush. Routed through _flush_and_observe so every flush outcome
+  # feeds the defer-streak early-wedge tracker.
   if [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
-    escalate_flush "$state" || true
+    _flush_and_observe "$state" || true
   else
     due=$(_oldest_line_age "$state/.subsuper-escalations")
     if [ "$due" -ge "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" ]; then
-      escalate_flush "$state" || true
+      _flush_and_observe "$state" || true
     fi
   fi
 
   # (1b) max-defer escape. If anything is still buffered past MAX_DEFER_SECS,
   # retry the normal delivery path. If that still cannot confirm, raise a loud
-  # wedge alarm while preserving the buffer.
+  # wedge alarm while preserving the buffer. Also feeds the streak tracker.
   max_defer=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
   if afk_active "$state" && [ "$max_defer" -gt 0 ] && [ -s "$state/.subsuper-escalations" ]; then
     oldest=$(_oldest_line_age "$state/.subsuper-escalations")
@@ -944,7 +1128,7 @@ housekeeping() {  # <state>
     # and waits.
     if [ "$oldest" -ge "$max_defer" ] \
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
-      if escalate_flush "$state"; then
+      if _flush_and_observe "$state"; then
         log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
         rm -f "$state/.subsuper-inject-wedged"
       else
@@ -952,6 +1136,11 @@ housekeeping() {  # <state>
       fi
     fi
   fi
+
+  # (1c) wake-path canary. A periodic no-inject probe of the full supervisor
+  # wake path; self-throttles to FM_CANARY_INTERVAL_SECS and is a strict no-op
+  # when afk is off. Implementation-blind early-wedge detection.
+  wake_canary "$state" || true
 
   # (2) stale persistence recheck
   for marker in "$state"/.subsuper-stale-*; do
@@ -1075,11 +1264,16 @@ window_for_task() {  # <task-key> [state]
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer
+  # FM_INJECT_LAST_REASON categorizes this call's outcome for the defer-streak
+  # tracker: '' on a confirmed delivery; busy/gone/composer/submit/afk on a
+  # defer. Reset here and set at every return so the caller (_flush_and_observe)
+  # never reads a stale reason from a prior call.
+  FM_INJECT_LAST_REASON=
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
   # watcher triage. Escalations buffer and survive for the next catch-up flush.
-  afk_active "$state" || { log "inject deferred: afk inactive"; return 1; }
+  afk_active "$state" || { log "inject deferred: afk inactive"; FM_INJECT_LAST_REASON=afk; return 1; }
   # (2) Single-line digest: collapse any embedded newlines so submission via
   # send-keys + Enter is unambiguous regardless of how the TUI composer treats
   # them. Then prepend the sentinel marker - firstmate's afk-exit contract
@@ -1093,11 +1287,12 @@ inject_msg() {  # <message> [state]
   # when unset (sourced/test contexts that never ran fm_super_main's startup
   # discovery), matching this function's pre-existing default assumption.
   backend="${FM_SUPERVISOR_BACKEND:-tmux}"
-  fm_backend_target_exists "$backend" "$target" || return 1
+  fm_backend_target_exists "$backend" "$target" || { FM_INJECT_LAST_REASON=gone; return 1; }
   # (3) Busy-guard: never inject into an in-use pane.
   #   a) pane_is_busy: the harness shows a busy footer (agent mid-turn).
   if pane_is_busy "$target" "$backend"; then
     log "inject deferred: supervisor pane busy (agent mid-turn)"
+    FM_INJECT_LAST_REASON=busy
     return 1
   fi
   #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
@@ -1112,6 +1307,7 @@ inject_msg() {  # <message> [state]
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
+    FM_INJECT_LAST_REASON=composer
     return 1
   fi
   # (4) Type the digest ONCE, then submit with Enter (retry Enter only, never
@@ -1128,6 +1324,7 @@ inject_msg() {  # <message> [state]
     return 0  # Backend confirmed the submit.
   fi
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
+  FM_INJECT_LAST_REASON=submit
   return 1
 }
 
@@ -1188,7 +1385,7 @@ handle_wake() {  # <reason> <state>
       # housekeeping re-escalates the same pane as a false wedge later.
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
       mark_escalated_seen "$kind" "$arg" "$state"
-      [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
+      [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { _flush_and_observe "$state" || true; }
       ;;
     pause)
       # Declared external-wait pause: record a pause marker (long re-surface

@@ -112,9 +112,29 @@ fi
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+# fm_afk_supervision_healthy: while state/.afk is present the away-mode
+# sub-supervisor daemon owns the watcher and runs it one-shot per poll, so no
+# foreground watcher holds the home watch-lock and fm_watcher_healthy correctly
+# fails. A live daemon plus a fresh beacon is still proof of supervision: the
+# daemon-liveness contract is reused (not restated) from bin/fm-afk-start.sh,
+# and beacon freshness was already computed by fm_supervision_status above into
+# FM_SUP_WATCHER_FRESH. fm-afk-start.sh enables errexit at source time; restore
+# the guard's set -u only. See docs/turnend-guard.md "Away-mode health".
+fm_afk_supervision_healthy() {
+  [ -e "$STATE/.afk" ] || return 1
+  # shellcheck source=bin/fm-afk-start.sh
+  . "$SCRIPT_DIR/fm-afk-start.sh" 2>/dev/null || return 1
+  set +e
+  FM_AFK_LOCK="$STATE/.supervise-daemon.lock" \
+    daemon_lock_held_by_live_daemon || return 1
+  [ "$FM_SUP_WATCHER_FRESH" = true ] || return 1
+  return 0
+}
+
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+fm_afk_supervision_healthy && exit 0
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
