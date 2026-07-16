@@ -300,6 +300,22 @@ crew_absorb_class() {  # <id>
     src=${line#*source: }; src=${src%% *}
     case "$src" in run-step|pane) printf 'working'; return ;; esac
   fi
+  # A verified-DONE crew (checks-green/open-PR) whose status log declares a
+  # deliberate external wait (paused: awaiting external PR review/merge) is
+  # legitimately idle: the work is complete and verified, and the only thing
+  # left is an event outside the crew's control (the captain merging). Absorb
+  # it on the pause cadence instead of wedge-escalating a settled PR-ready
+  # pane. Gated on the authoritative `done` state so a failed/unknown/parked or
+  # otherwise-unfinished crew still surfaces even if a stale paused line lingers
+  # in its log, and so a `done` crew that did NOT declare a pause still surfaces
+  # for firstmate to act on (teardown / relay the PR).
+  if [ "$state" = "done" ]; then
+    local st_dir="${FM_STATE_OVERRIDE:-${STATE:-}}" st_line
+    if [ -n "$st_dir" ] && [ -f "$st_dir/$id.status" ]; then
+      st_line=$(last_status_line "$st_dir/$id.status")
+      status_is_paused "$st_line" && { printf 'paused'; return; }
+    fi
+  fi
   printf 'none'
 }
 
