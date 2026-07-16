@@ -136,10 +136,36 @@ fm_backend_orca_repo_ensure() {  # <project-path>
   printf '%s' "$repo_id"
 }
 
-fm_backend_orca_worktree_create() {  # <project-path> <name>
-  local project=$1 name=$2 repo_id out wt_id wt_path terminal
+# fm_backend_orca_parent_selector: resolve a trustworthy parent worktree
+# selector from the environment when firstmate itself runs under Orca. Orca
+# sets ORCA_WORKTREE_ID to the caller's own worktree (the captain's session)
+# in the repo-qualified form <repo-uuid>::<path>. A firstmate delegate is by
+# definition a child of that session, so it is the correct parent lineage
+# target. Returns the id:-prefixed selector on stdout; returns 1 (silently)
+# when no trustworthy parent can be discovered so the caller falls back to
+# --no-parent. Never guesses a parent from unrelated worktrees.
+fm_backend_orca_parent_selector() {
+  [ -n "${ORCA_WORKTREE_ID:-}" ] || return 1
+  case "$ORCA_WORKTREE_ID" in
+    *'::'*) : ;;
+    *) return 1 ;;
+  esac
+  printf 'id:%s' "$ORCA_WORKTREE_ID"
+}
+
+fm_backend_orca_worktree_create() {  # <project-path> <name> [parent-selector]
+  local project=$1 name=$2 parent=${3:-} repo_id out wt_id wt_path terminal
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
+  [ -n "$parent" ] || parent=$(fm_backend_orca_parent_selector 2>/dev/null || true)
+  if [ -n "$parent" ]; then
+    out=$(orca worktree create --repo "id:$repo_id" --name "$name" --parent-worktree "$parent" --setup skip --json 2>/dev/null) || {
+      # Parent linkage is best-effort: a stale or deleted parent is not a
+      # spawn blocker, so retry without a parent rather than failing.
+      out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
+    }
+  else
+    out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
+  fi
   wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id) || {
     echo "error: orca worktree create did not return a worktree id for $name" >&2
     return 1

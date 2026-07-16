@@ -110,7 +110,7 @@ BASE_REF=$(resolve_base_ref) \
 # tmux-only conformance run the tmux adapter's behavior is what is under test,
 # and that is unchanged by any later (e.g. non-tmux backend) addition to
 # fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-supervision-lib.sh fm-lock-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh fm-decision-hold.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
@@ -118,8 +118,13 @@ build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry p
   root="$TMP_ROOT/$name"
   bin="$root/bin"
   mkdir -p "$bin"
+  # Symlink a sibling only when this checkout actually has it: main can gain a
+  # sibling the BASE_REF scripts already source (e.g. fm-decision-hold.sh on the
+  # scout completion gate) before this branch picks the file up, and a dangling
+  # symlink would surface as a confusing "No such file or directory" from the
+  # sourced path rather than the real "branch lacks the file" signal.
   for f in $OLD_BIN_UNCHANGED_SIBLINGS; do
-    ln -s "$ROOT/bin/$f" "$bin/$f"
+    [ -e "$ROOT/bin/$f" ] && ln -s "$ROOT/bin/$f" "$bin/$f"
   done
   ln -s "$ROOT/bin/backends" "$bin/backends"
   for f in $OLD_BIN_REFACTORED; do
@@ -531,8 +536,8 @@ test_resolve_selector_three_forms() {
     || fail "exact fm-* task id should resolve through its exact metadata"
   [ "$(fm_backend_of_selector 'fm-turnend-all-harnesses-v9' 'default:wB:p3' "$state")" = herdr ] \
     || fail "exact fm-* task id should use exact metadata without stripping fm-"
-  [ "$(fm_backend_expected_label_of_selector 'fm-turnend-all-harnesses-v9' "$state")" = "fm-fm-turnend-all-harnesses-v9" ] \
-    || fail "exact fm-* task id should report the spawned fm-<id> label"
+  [ "$(fm_backend_expected_label_of_selector 'fm-turnend-all-harnesses-v9' "$state")" = "fm-turnend-all-harnesses-v9" ] \
+    || fail "exact fm-* task id should report an idempotent fm-<id> label (no doubling)"
 
   [ "$(fm_backend_resolve_selector 'fm-task1' "$state")" = "firstmate:fm-task1" ] \
     || fail "legacy fm-<id> label should resolve through <id>.meta's window="
@@ -596,6 +601,58 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "explicit target with no matching metadata should keep the tmux compatibility default"
 
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
+}
+
+test_alias_for_id_is_idempotent() {
+  [ "$(fm_alias_for_id 'fix-login-k3')" = "fm-fix-login-k3" ] \
+    || fail "fm_alias_for_id should prepend fm- to a bare task id"
+  [ "$(fm_alias_for_id 'fm-orca-task-h2')" = "fm-orca-task-h2" ] \
+    || fail "fm_alias_for_id should NOT double the prefix on an id already starting fm-"
+  [ "$(fm_alias_for_id 'fm-x')" = "fm-x" ] \
+    || fail "fm_alias_for_id should leave a single-char fm- id unchanged"
+  pass "fm_alias_for_id: idempotent fm- prefix (no fm-fm-* doubling)"
+}
+
+test_legacy_doubled_selector_still_resolves() {
+  local state=$TMP_ROOT/doubled-selector-state
+  mkdir -p "$state"
+  fm_write_meta "$state/fm-orca-fix-k2.meta" "window=fm-orca-fix-k2" "backend=orca"
+  # The bare task id (also starts with fm-) resolves through exact metadata.
+  [ "$(fm_backend_task_id_for_selector 'fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "bare fm-* task id should resolve via exact metadata"
+  # Legacy doubled selector fm-fm-<id> still resolves via the single fm- strip.
+  [ "$(fm_backend_task_id_for_selector 'fm-fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "legacy doubled fm-fm-<id> selector must still resolve via single-prefix strip"
+  # The expected label for the bare id is now single-prefix (idempotent).
+  [ "$(fm_backend_expected_label_of_selector 'fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "expected label for an fm-* task id should be idempotent"
+  # A legacy doubled selector still resolves its label to the single-prefix form.
+  [ "$(fm_backend_expected_label_of_selector 'fm-fm-orca-fix-k2' "$state")" = "fm-orca-fix-k2" ] \
+    || fail "legacy doubled selector label should resolve to the single-prefix idempotent alias"
+  pass "legacy doubled fm-fm-* selectors still resolve through single-prefix strip; expected_label is idempotent"
+}
+
+test_fleet_snapshot_expected_label_jq_matches_alias_helper() {
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  local id alias_label jq_label
+  for id in fix-login-k3 fm-orca-fix-k2 fm-x ""; do
+    alias_label=$( bash -c '. "$0"; fm_alias_for_id "$1"' "$ROOT/bin/fm-backend.sh" "$id" )
+    jq_label=$( printf '{"id":%s}' "$(printf '%s' "$id" | jq -Rs .)" \
+      | jq -r '(.id // "") as $i | if ($i | startswith("fm-")) then $i else "fm-" + $i end' )
+    [ "$jq_label" = "$alias_label" ] \
+      || fail "fleet-snapshot expected-label jq ('$jq_label') must match fm_alias_for_id ('$alias_label') for id='$id'"
+  done
+  pass "fm-fleet-snapshot expected-label jq is idempotent (no fm-fm-*) and matches fm_alias_for_id"
+}
+
+test_ff_lib_sources_alias_helper() {
+  local out home
+  home=$(fm_test_tmproot ff-lib-alias-home)
+  mkdir -p "$home"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/fm-ff-lib.sh"; printf "%s\n" "$(fm_alias_for_id "fm-orca-fix-k2")"' "$ROOT" 2>&1 )
+  [ "$out" = "fm-orca-fix-k2" ] \
+    || fail "sourcing fm-ff-lib.sh should make fm_alias_for_id available (so fm-update.sh, which sources ff-lib but not fm-backend.sh, gets it) without doubling an fm-* id; got '$out'"
+  pass "fm-ff-lib.sh: sources fm-backend.sh so fm_alias_for_id is available to every caller"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------
@@ -924,6 +981,10 @@ test_teardown_conformance_old_vs_new() {
   config_old="$TMP_ROOT/teardown-config-old"; config_new="$TMP_ROOT/teardown-config-new"
   mkdir -p "$state_old" "$state_new" "$config_old" "$config_new"
 
+  # decisions_reviewed=1 satisfies the scout unresolved-decision completion gate
+  # (bin/fm-decision-hold.sh verify) once main's fm-teardown.sh carries it: a
+  # scout that has cleared its captain decision inventory may be torn down. On
+  # older BASE_REFs without the gate the extra meta field is simply ignored.
   fm_write_meta "$state_old/$id.meta" \
     "window=firstmate:fm-$id" "worktree=$wt" "project=$proj" "harness=claude" "kind=scout" "mode=no-mistakes" "yolo=off" \
     "decisions_reviewed=1" "decision_keys="
@@ -1081,6 +1142,10 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_alias_for_id_is_idempotent
+test_legacy_doubled_selector_still_resolves
+test_fleet_snapshot_expected_label_jq_matches_alias_helper
+test_ff_lib_sources_alias_helper
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal

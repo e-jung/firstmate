@@ -24,6 +24,9 @@
 # default branch, so the fast-forward advances HEAD only and never moves the
 # shared default branch or any other worktree's checkout.
 
+# shellcheck source=bin/fm-backend.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/fm-backend.sh"
+
 SUB_HOME_MARKER="${SUB_HOME_MARKER:-.fm-secondmate-home}"
 
 # --- helpers ---------------------------------------------------------------
@@ -409,7 +412,7 @@ process_secondmate() {
     if [ "$nudge_requires_instr" = yes ] && [ -z "$FF_INSTR" ]; then
       return 0
     fi
-    FF_NUDGE_WINDOWS="$FF_NUDGE_WINDOWS fm-$id"
+    FF_NUDGE_WINDOWS="$FF_NUDGE_WINDOWS $(fm_alias_for_id "$id")"
   fi
 }
 
