@@ -43,6 +43,14 @@ const runtime = r.runtime || {};
 const reachable = runtime.reachable ?? r.runtimeReachable;
 const state = runtime.state || r.runtimeState || "";
 if (reachable === true && state === "ready") process.exit(0);
+// stale_bootstrap: Orca reports the local server process is not alive, but its
+// bootstrap metadata file is still on disk. Surface a cross-platform recovery
+// hint (desktop app or a supervised `orca serve` service) instead of the generic
+// readiness line; fail-closed is unchanged - no auto-restart, no backend swap.
+if (state === "stale_bootstrap") {
+  console.error("error: Orca runtime is not running (state=stale_bootstrap): the local Orca process is not alive, but its bootstrap metadata remains. Start the Orca desktop app, or start your supervised orca serve service, then retry.");
+  process.exit(1);
+}
 console.error(`error: backend=orca requires a ready Orca runtime (reachable=${String(reachable)}, state=${state || "unknown"})`);
 process.exit(1);
 '
