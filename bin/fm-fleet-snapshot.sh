@@ -421,7 +421,7 @@ task_json_lines() {
 
     endpoint_exists=null
     if [ -n "$target" ]; then
-      if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
+      if fm_backend_target_exists "$backend" "$target" "$(fm_alias_for_id "$id")" >/dev/null 2>&1; then
         endpoint_exists=true
       else
         endpoint_exists=false
@@ -853,7 +853,7 @@ terminal_evidence_json() {  # <parent-task-json> <event-note> <evidence-contradi
   backend=$(printf '%s' "$task" | jq -r '.backend // ""')
   target=$(printf '%s' "$task" | jq -r '.endpoint.target // ""')
   exists=$(printf '%s' "$task" | jq -r '.endpoint.exists // "unknown"')
-  expected=$(printf '%s' "$task" | jq -r '"fm-" + (.id // "")')
+  expected=$(printf '%s' "$task" | jq -r '(.id // "") as $i | if ($i | startswith("fm-")) then $i else "fm-" + $i end')
   if [ -z "$target" ] || [ "$exists" = false ]; then
     [ "$exists" = false ] && reason="recorded endpoint is absent" || reason="no recorded endpoint"
     jq -n --arg observed "$SNAPSHOT_NOW" --arg reason "$reason" \

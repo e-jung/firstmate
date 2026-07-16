@@ -145,10 +145,10 @@ fm_backend_orca_parent_selector() {
   printf 'id:%s' "$ORCA_WORKTREE_ID"
 }
 
-fm_backend_orca_worktree_create() {  # <project-path> <name>
-  local project=$1 name=$2 repo_id out wt_id wt_path terminal parent
+fm_backend_orca_worktree_create() {  # <project-path> <name> [parent-selector]
+  local project=$1 name=$2 parent=${3:-} repo_id out wt_id wt_path terminal
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  parent=$(fm_backend_orca_parent_selector 2>/dev/null || true)
+  [ -n "$parent" ] || parent=$(fm_backend_orca_parent_selector 2>/dev/null || true)
   if [ -n "$parent" ]; then
     out=$(orca worktree create --repo "id:$repo_id" --name "$name" --parent-worktree "$parent" --setup skip --json 2>/dev/null) || {
       # Parent linkage is best-effort: a stale or deleted parent is not a

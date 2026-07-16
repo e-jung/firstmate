@@ -186,6 +186,7 @@ if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
 fi
 if [ "$BACKEND" = orca ]; then
   fm_backend_orca_runtime_check || exit 1
+  ORCA_PARENT_SELECTOR=$(fm_backend_orca_parent_selector 2>/dev/null || true)
 fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
@@ -769,7 +770,7 @@ EOF
     ;;
   orca)
     set +e
-    ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
+    ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W" "$ORCA_PARENT_SELECTOR")
     ORCA_WT_STATUS=$?
     set -e
     if [ "$ORCA_WT_STATUS" -ne 0 ]; then

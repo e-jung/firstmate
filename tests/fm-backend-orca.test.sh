@@ -605,6 +605,82 @@ test_spawn_writes_orca_metadata_and_launches_harness() {
   pass "fm-spawn.sh --backend orca: reuses implicit terminal, records metadata, launches harness"
 }
 
+test_worktree_create_honors_explicit_parent_arg_over_cleared_env() {
+  local out log_text
+  orca_case parent-arg-over-cleared-env
+  printf '{"ok":true,"result":{"repo":{"id":"repo-explicit"}}}\n' > "$RESP/1.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-explicit","path":"/tmp/orca-explicit-wt"}}}\n' > "$RESP/2.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c 'unset ORCA_WORKTREE_ID; . "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task "id:captain-explicit::/home/captain/firstmate"' "$ROOT" )
+  log_text=$(cat "$LOG")
+  assert_contains "$log_text" $'\x1f''--parent-worktree'$'\x1f''id:captain-explicit::/home/captain/firstmate'$'\x1f' \
+    "worktree create should use the explicit parent-selector arg even with ORCA_WORKTREE_ID cleared"
+  assert_not_contains "$log_text" '--no-parent' \
+    "worktree create should not fall back to --no-parent when an explicit parent is threaded in"
+  pass "fm_backend_orca_worktree_create: honors an explicit parent-selector arg over a cleared env"
+}
+
+test_fm_spawn_threads_inherited_captain_parent_into_orca_worktree_create() {
+  local proj wt data state config id out log
+  id="orcaspawnparent1"
+  proj="$TMP_ROOT/spawn-parent-project"
+  wt="$TMP_ROOT/spawn-parent-wt"
+  data="$TMP_ROOT/spawn-parent-data"
+  state="$TMP_ROOT/spawn-parent-state"
+  config="$TMP_ROOT/spawn-parent-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case spawn-parent
+  log="$LOG"
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-spawn-parent"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn-parent","path":"%s"},"terminal":{"handle":"term-spawn-parent"}}}\n' "$wt" > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    ORCA_WORKTREE_ID="captain-uuid-9::/home/captain/firstmate" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  expect_code 0 $? "fm-spawn.sh --backend orca should succeed under a captain Orca session"$'\n'"$out"
+  assert_grep $'orca\x1fworktree\x1fcreate' "$log" "spawn never reached the orca worktree create call"
+  assert_grep $'--parent-worktree\x1fid:captain-uuid-9::/home/captain/firstmate' "$log" \
+    "spawn should thread the inherited captain id into --parent-worktree even though fm-spawn clears ORCA_WORKTREE_ID before the create call"
+  assert_no_grep '--no-parent' "$log" "spawn should not fall back to --no-parent when a captain session is inherited"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: captures the captain ORCA_WORKTREE_ID before clearing it and threads it into orca worktree create"
+}
+
+test_fm_spawn_uses_no_parent_when_not_running_under_orca() {
+  local proj wt data state config id out log
+  id="orcaspawnnoparent1"
+  proj="$TMP_ROOT/spawn-no-parent-project"
+  wt="$TMP_ROOT/spawn-no-parent-wt"
+  data="$TMP_ROOT/spawn-no-parent-data"
+  state="$TMP_ROOT/spawn-no-parent-state"
+  config="$TMP_ROOT/spawn-no-parent-config"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case spawn-no-parent
+  log="$LOG"
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-spawn-no-parent"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-spawn-no-parent","path":"%s"},"terminal":{"handle":"term-spawn-no-parent"}}}\n' "$wt" > "$RESP/3.out"
+  out=$( env -u ORCA_WORKTREE_ID \
+    PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca 2>&1 )
+  expect_code 0 $? "fm-spawn.sh --backend orca should succeed with no captain session"$'\n'"$out"
+  assert_grep $'orca\x1fworktree\x1fcreate' "$log" "spawn never reached the orca worktree create call"
+  assert_grep '--no-parent' "$log" "spawn should use --no-parent when not running under a captain Orca session"
+  assert_no_grep '--parent-worktree' "$log" "spawn should not pass --parent-worktree when no captain session is inherited"
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: falls back to --no-parent when no trustworthy captain ORCA_WORKTREE_ID is inherited"
+}
+
 test_spawn_refuses_orca_secondmate_before_home_mutation() {
   local home subhome data state config id out status
   id="orcasmz1"
@@ -1400,6 +1476,9 @@ test_worktree_create_uses_parent_when_orca_worktree_id_set
 test_worktree_create_uses_no_parent_when_orca_worktree_id_absent
 test_worktree_create_falls_back_to_no_parent_when_parent_link_fails
 test_worktree_create_shell_safely_passes_repo_qualified_parent_id
+test_worktree_create_honors_explicit_parent_arg_over_cleared_env
+test_fm_spawn_threads_inherited_captain_parent_into_orca_worktree_create
+test_fm_spawn_uses_no_parent_when_not_running_under_orca
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_refuses_orca_secondmate_before_home_mutation

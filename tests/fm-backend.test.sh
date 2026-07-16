@@ -627,6 +627,29 @@ test_legacy_doubled_selector_still_resolves() {
   pass "legacy doubled fm-fm-* selectors still resolve through single-prefix strip; expected_label is idempotent"
 }
 
+test_fleet_snapshot_expected_label_jq_matches_alias_helper() {
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  local id alias_label jq_label
+  for id in fix-login-k3 fm-orca-fix-k2 fm-x ""; do
+    alias_label=$( bash -c '. "$0"; fm_alias_for_id "$1"' "$ROOT/bin/fm-backend.sh" "$id" )
+    jq_label=$( printf '{"id":%s}' "$(printf '%s' "$id" | jq -Rs .)" \
+      | jq -r '(.id // "") as $i | if ($i | startswith("fm-")) then $i else "fm-" + $i end' )
+    [ "$jq_label" = "$alias_label" ] \
+      || fail "fleet-snapshot expected-label jq ('$jq_label') must match fm_alias_for_id ('$alias_label') for id='$id'"
+  done
+  pass "fm-fleet-snapshot expected-label jq is idempotent (no fm-fm-*) and matches fm_alias_for_id"
+}
+
+test_ff_lib_sources_alias_helper() {
+  local out home
+  home=$(fm_test_tmproot ff-lib-alias-home)
+  mkdir -p "$home"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/fm-ff-lib.sh"; printf "%s\n" "$(fm_alias_for_id "fm-orca-fix-k2")"' "$ROOT" 2>&1 )
+  [ "$out" = "fm-orca-fix-k2" ] \
+    || fail "sourcing fm-ff-lib.sh should make fm_alias_for_id available (so fm-update.sh, which sources ff-lib but not fm-backend.sh, gets it) without doubling an fm-* id; got '$out'"
+  pass "fm-ff-lib.sh: sources fm-backend.sh so fm_alias_for_id is available to every caller"
+}
+
 # --- old vs new: fm-send.sh --------------------------------------------------
 
 make_send_fakebin() {  # <dir> -> echoes fakebin dir; logs every tmux call to $FM_TMUX_LOG
@@ -1110,6 +1133,8 @@ test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_alias_for_id_is_idempotent
 test_legacy_doubled_selector_still_resolves
+test_fleet_snapshot_expected_label_jq_matches_alias_helper
+test_ff_lib_sources_alias_helper
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
